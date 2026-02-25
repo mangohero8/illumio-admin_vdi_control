@@ -1,0 +1,122 @@
+# =============================================================================
+# MON.C9.9 — Admin VDI Control Test Configuration
+# =============================================================================
+# Environment variables override these values:
+#   ILLUMIO_FQDN, ILLUMIO_PORT, ILLUMIO_ORG_ID,
+#   ILLUMIO_API_USER, ILLUMIO_API_KEY
+# =============================================================================
+
+# --- PCE Connection ---
+pce:
+  fqdn: "us-scp14.illum.io"
+  port: "8443"
+  org_id: "1"
+  # Credentials — prefer environment variables for production use
+  # Set ILLUMIO_API_USER and ILLUMIO_API_KEY as env vars
+  # api_user: "api_xxxxxxxxx"
+  # api_key: "xxxxxxxxxxxxxxxxxxxxxxxxx"
+
+# --- Compliance Rules ---
+compliance:
+
+  # Restricted ports/protocols for admin VDI access
+  # proto: 6 = TCP, 17 = UDP
+  restricted_ports:
+    - port: 22
+      proto: 6       # SSH / TCP
+    - port: 23
+      proto: 6       # Telnet / TCP
+    - port: 3389
+      proto: 6       # RDP / TCP
+    - port: 3389
+      proto: 17      # RDP / UDP
+    - port: 7389
+      proto: 6       # Secure RDP (custom) / TCP
+
+  # -----------------------------------------------------------------------
+  # EXCLUDED SOURCES — Non-end-user policy objects
+  # -----------------------------------------------------------------------
+  # These are stripped from the Sources column during Step 1 of the
+  # decision filter chain. Rules where ALL sources are excluded
+  # are marked as compliant.
+  #
+  # Supports wildcard suffix matching with '*'
+  # -----------------------------------------------------------------------
+
+  # Excluded IP Lists
+  excluded_sources:
+    - "IPL-ADMIN_VDI"
+    - "IPL-CLUSTER_LINK_LOCAL"
+    - "IPL-MAINFRAME_*"                # Covers IPL-MAINFRAME_P7, _PD, _DV
+    - "IPL-GUARDIUM-100028"
+    - "IPL-IPT_VOICE_INFRASTRUCTURE_CORE_DATA_CENTER_NETWORKS"
+    - "IPL-LOAD_BALANCERS"
+    - "IPL-WEB_DMZ_DC162"
+    - "IPL-WEB_DMZ_DC2"
+    - "IPL-WEB_DMZ_1TM_PD-900055"
+    - "IPL-INTERNAL_1TM_PD-900055"
+
+  # Excluded Labels (stripped during source filtering)
+  excluded_labels:
+    - "A-*"          # Application labels (handled as permitted sources)
+    - "E-*"          # Environment labels (handled as permitted sources)
+    - "R-METTLE-CI"
+    - "A-EIM_*"      # EIM application labels
+    - "METTLECI-*"   # METTLECI correlation labels
+
+  # Excluded Label Groups
+  excluded_label_groups:
+    - "LG-E-NON_QUARANTINE"
+
+  # -----------------------------------------------------------------------
+  # EUC PATTERNS — End User Compute (flagged for MANUAL REVIEW)
+  # -----------------------------------------------------------------------
+  # Sources matching these patterns are NOT auto-excluded. Instead they
+  # are placed in the "Requires Review" bucket because
+  # A-END_USER_COMPUTE contains end-user listings that should be
+  # reviewed for access outside IPL-ADMIN_VDI.
+  #
+  # NOTE: EUC check runs AFTER the excluded sources are stripped,
+  # so these patterns should NOT also appear in excluded_labels above.
+  # If A-* is in excluded_labels, you must handle EUC BEFORE the
+  # general A-* exclusion. The script handles this by checking EUC
+  # patterns first in the decision engine.
+  # -----------------------------------------------------------------------
+  euc_patterns:
+    - "A-END_USER_COMPUTE_*"
+
+  # -----------------------------------------------------------------------
+  # IMPORTANT: The decision engine processes in this order:
+  #   1. Strip excluded_sources (IPLs)
+  #   2. Strip excluded_labels (BUT preserves EUC matches for review)
+  #   3. Strip excluded_label_groups
+  #   4. If nothing remains → Excluded
+  #   5. If EUC remains → Review
+  #   6. If IPL- remains → Review
+  #   7. If A- to A- → Excluded (app-to-app)
+  #   8. If env/label-group only → Edge case review
+  #   9. Everything else → Non-compliant
+  #
+  # Because A-* is in excluded_labels, the engine has special handling:
+  # it checks for EUC patterns BEFORE applying the A-* exclusion,
+  # ensuring EUC sources are flagged for review rather than silently
+  # excluded.
+  # -----------------------------------------------------------------------
+
+  # Environment label values that qualify as "Production"
+  production_env_values:
+    - "Production"
+    - "Prod"
+    - "E-Production"
+    - "E-Prod"
+    - "E-PD"
+
+# --- Output ---
+output:
+  # report_dir: "/path/to/reports/"
+  # utility_server_path: "/path/to/MON C9/Admin VDI/"
+
+# --- Logging ---
+logging:
+  log_file: "vdi_control_test.log"
+  level: "DEBUG"
