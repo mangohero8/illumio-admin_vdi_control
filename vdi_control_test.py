@@ -148,10 +148,11 @@ def setup_logging(log_file="vdi_control_test.log"):
 # =============================================================================
 
 class IllumioClient:
-    """REST client for Illumio PCE API v2 with automatic pagination."""
+    """REST client for Illumio PCE API v2."""
 
-    # Illumio PCE default max_results per page
-    PAGE_SIZE = 500
+    # Use a large max_results to fetch all items in a single request,
+    # matching the approach used in the proven working script.
+    MAX_RESULTS = 100000
 
     def __init__(self, fqdn, port, org_id, api_user, api_key):
         self.base = f"https://{fqdn}:{port}/api/v2/orgs/{org_id}"
@@ -163,95 +164,47 @@ class IllumioClient:
         self.fqdn = fqdn
         self.org_id = org_id
 
-    def _get(self, ep, params=None):
-        """Single GET with retry (3 attempts)."""
+    def _fetch(self, ep, params=None):
+        """GET with retry (3 attempts) and max_results=100000."""
+        if params is None:
+            params = {}
+        params.setdefault("max_results", self.MAX_RESULTS)
+
         url = f"{self.base}{ep}"
         for attempt in range(1, 4):
             try:
-                r = self.s.get(url, params=params, timeout=60)
+                logging.info(f"Fetching items from URL: {url}?max_results={params['max_results']}")
+                r = self.s.get(url, params=params, timeout=120)
                 r.raise_for_status()
-                return r
+                data = r.json()
+
+                # Handle both list and dict response formats
+                items = data if isinstance(data, list) else data.get("items", data.get("results", []))
+                logging.info(f"Successfully fetched {len(items)} items from {url}")
+                return items
             except Exception as e:
                 logging.error(f"API error {url} (attempt {attempt}): {e}")
                 if attempt == 3: raise
 
-    def _get_all(self, ep, params=None):
-        """
-        GET with automatic pagination.
-
-        Illumio PCE API uses offset-based pagination:
-          - Request params: max_results (page size), offset (starting index)
-          - Response header: X-Total-Count (total items available)
-
-        Returns all items across all pages as a single list.
-        """
-        if params is None:
-            params = {}
-
-        params.setdefault("max_results", self.PAGE_SIZE)
-        offset = 0
-        all_items = []
-        total = None
-
-        while True:
-            params["offset"] = offset
-            resp = self._get(ep, params=params)
-            data = resp.json()
-
-            # Handle both list and dict response formats
-            if isinstance(data, list):
-                page = data
-            else:
-                page = data.get("items", data.get("results", []))
-                if not page and isinstance(data, dict):
-                    # Some endpoints return the list directly in a wrapper
-                    page = [v for v in data.values() if isinstance(v, list)]
-                    page = page[0] if page else []
-
-            all_items.extend(page)
-
-            # Get total count from header (first page)
-            if total is None:
-                total_header = resp.headers.get("X-Total-Count")
-                if total_header:
-                    total = int(total_header)
-                    logging.debug(f"  {ep}: X-Total-Count={total}")
-
-            # Determine if more pages exist
-            if total is not None:
-                # We know the total — paginate until we have them all
-                if len(all_items) >= total:
-                    break
-            else:
-                # No total header — stop if we got fewer than page size
-                if len(page) < self.PAGE_SIZE:
-                    break
-
-            offset += len(page)
-            logging.debug(f"  {ep}: fetched {len(all_items)} so far, offset={offset}")
-
-        logging.info(f"  {ep}: {len(all_items)} total items (paginated)")
-        return all_items
-
     def get_services(self):
-        logging.info("Fetching services...")
-        return self._get_all("/sec_policy/active/services")
+        logging.info("Building service map...")
+        return self._fetch("/sec_policy/active/services")
 
     def get_rulesets(self):
-        logging.info("Fetching rulesets...")
-        return self._get_all("/sec_policy/active/rule_sets")
+        logging.info("Fetching all rulesets...")
+        return self._fetch("/sec_policy/active/rule_sets")
 
     def get_labels(self):
-        logging.info("Fetching labels...")
-        return self._get_all("/labels")
+        logging.info("Building label map...")
+        return self._fetch("/labels")
 
     def get_ip_lists(self):
-        logging.info("Fetching IP lists...")
-        return self._get_all("/sec_policy/active/ip_lists")
+        logging.info("Building IP list map...")
+        return self._fetch("/sec_policy/active/ip_lists")
 
     def get_label_groups(self):
-        logging.info("Fetching label groups...")
-        return self._get_all("/sec_policy/active/label_groups")
+        logging.info("Building label group map...")
+        return self._fetch("/sec_policy/active/label_groups")
 
 
 # =============================================================================
@@ -472,21 +425,20 @@ def extract_scope(ruleset, lookup):
                     parts.append(info["name"])
     return " | ".join(parts) or "Unscoped"
 
-def is_prod(ruleset, lookup, prod_values):
-    pv = [v.lower() for v in prod_values]
+def is_epd_scope(ruleset, lookup):
+    """Check if ruleset is scoped to E-PD (Production). Strict match."""
     for ss in ruleset.get("scopes", []):
         if isinstance(ss, list):
             for e in ss:
                 if isinstance(e, dict):
                     info = lookup.get(e.get("label", {}).get("href", ""), {})
-                    if info.get("key") == "env" and info.get("name", "").lower() in pv:
+                    if info.get("key") == "env" and info.get("name") == "E-PD":
                         return True
     return False
 
 def process_api(client, config):
     comp = config.get("compliance", {})
     rp = comp.get("restricted_ports", [{"port":22,"proto":6},{"port":23,"proto":6},{"port":3389,"proto":6},{"port":3389,"proto":17},{"port":7389,"proto":6},{"port":7389,"proto":17}])
-    pv = comp.get("production_env_values", ["Production","Prod","E-Production","E-Prod","E-PD"])
 
     svcs = client.get_services()
     labels = client.get_labels()
@@ -504,16 +456,26 @@ def process_api(client, config):
                  skip_non_prod=0, skip_intra=0, skip_disabled=0, skip_no_restricted=0)
 
     for rs in rsets:
-        if not is_prod(rs, lookup, pv):
-            stats["skip_non_prod"] += 1; continue
-        stats["production_rulesets"] += 1
+        rs_name = rs.get("name", "Unknown")
         scope = extract_scope(rs, lookup)
+        rules = rs.get("rules", [])
 
-        for rule in rs.get("rules", []):
+        # Strict E-PD scope filter
+        if not is_epd_scope(rs, lookup):
+            stats["skip_non_prod"] += 1
+            logging.info(f"Rule skipped: not in E-PD scope.")
+            continue
+
+        stats["production_rulesets"] += 1
+        logging.info(f"Processing ruleset: {rs_name} | {scope} with {len(rules)} rules.")
+
+        for rule in rules:
             stats["total_rules"] += 1
+
             if not rule.get("unscoped_consumers", False):
                 stats["skip_intra"] += 1; continue
             stats["extra_scope"] += 1
+
             if not rule.get("enabled", True):
                 stats["skip_disabled"] += 1; continue
 
@@ -521,17 +483,21 @@ def process_api(client, config):
             dests = resolve_actors(rule.get("providers", []), lookup)
             svc_names, has_restricted = check_api_services_restricted(rule.get("ingress_services", []), rsvc, rp)
 
-            # Strip type prefixes from display strings
             src_str = "; ".join(s["name"] for s in sources)
             dst_str = "; ".join(d["name"] for d in dests)
             svc_str = "; ".join(svc_names)
 
-            entry = {"ruleset": rs.get("name",""), "scopes": scope, "rule_href": rule.get("href",""),
+            # Log special cases like working script does
+            if any(s["name"] == "All Workloads" and s["type"] == "actors" for s in sources):
+                logging.info(f"Rule source includes All Workloads (ams).")
+
+            entry = {"ruleset": rs_name, "scopes": scope, "rule_href": rule.get("href",""),
                      "sources": src_str, "sources_remaining": "", "destinations": dst_str,
                      "services": svc_str, "decision": "", "reason": ""}
 
             if not has_restricted:
                 stats["skip_no_restricted"] += 1
+                logging.info("Rule skipped: no restricted services.")
                 entry["decision"] = "N/A – No Restricted Ports"
                 ex.append(entry); stats["excluded"] += 1; continue
 
@@ -542,10 +508,16 @@ def process_api(client, config):
             entry["sources_remaining"] = "; ".join(s["name"] for s in rem) if rem else "(none)"
 
             if dec.startswith("Exclude"):
+                if not rem:
+                    logging.warning(f"Rule with blank sources or destinations in ruleset: {rs_name} | {scope}")
+                else:
+                    logging.info(f"Rule skipped: sources matches exclude pattern.")
                 ex.append(entry); stats["excluded"] += 1
             elif dec.startswith("Keep"):
+                logging.info(f"Rule flagged for review: {dec}")
                 rv.append(entry); stats["needs_review"] += 1
             else:
+                logging.warning(f"NON-COMPLIANT rule in {rs_name}: {reason}")
                 nc.append(entry); stats["non_compliant"] += 1
 
     return nc, rv, ex, stats
