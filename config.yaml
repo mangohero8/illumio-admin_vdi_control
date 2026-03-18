@@ -1,57 +1,119 @@
 # =============================================================================
 # MON.C9.9 — Admin VDI Control Test Configuration
+# Version: 3.0.0
 # =============================================================================
-# Env var overrides: ILLUMIO_FQDN, ILLUMIO_PORT, ILLUMIO_ORG_ID,
-#                    ILLUMIO_API_USER, ILLUMIO_API_KEY
+#
+# This file configures the automated Admin VDI control test. All excluded
+# sources, restricted ports, and PCE connection details are defined here
+# so the script can be updated without code changes.
+#
+# Credential precedence: Environment variables override config file values.
+#   ILLUMIO_FQDN, ILLUMIO_PORT, ILLUMIO_ORG_ID,
+#   ILLUMIO_API_USER, ILLUMIO_API_KEY
+#
 # =============================================================================
 
 pce:
   fqdn: "us-scp14.illum.io"
   port: "443"
   org_id: "3801148"
-  # Credentials — use env vars for production
+  # Credentials — use environment variables for production
   # api_user: "api_xxxxxxxxx"
   # api_key: "xxxxxxxxxxxxxxxxxxxxxxxxx"
 
 compliance:
 
-  # Restricted ports (as strings for service port matching)
+  # -----------------------------------------------------------------------
+  # RESTRICTED PORTS
+  # -----------------------------------------------------------------------
+  # Admin VDI ports targeted by MON.C9.9. Matched against Illumio service
+  # port definitions. Strings to match the service_ports parsing logic.
+  # -----------------------------------------------------------------------
   restricted_ports:
     - "22"      # SSH
     - "23"      # Telnet
-    - "3389"    # RDP
-    - "7389"    # Secure RDP (DMZ)
+    - "3389"    # RDP (TCP and UDP)
+    - "7389"    # Secure RDP / DMZ (TCP and UDP)
 
-  # ----- EXCLUDED SOURCES (non-end-user policy objects) -----
-  # Stripped in Step 1 of decision filter chain.
+  # -----------------------------------------------------------------------
+  # EXCLUDED SOURCES — Non-end-user policy objects
+  # -----------------------------------------------------------------------
+  # These are stripped from the Sources column during Step 1 of the decision
+  # filter chain. Rules where ALL sources are excluded = Compliant.
+  #
+  # Supports wildcard suffix matching with '*'
+  #
+  # Reference: Admin VDI Control Test Guide v1.2, "Removing Non-end user
+  # policy objects" section. Each entry includes the rationale from the guide.
+  # -----------------------------------------------------------------------
 
   excluded_sources:   # IP Lists
-    - "IPL-ADMIN_VDI"                    # Expected traffic path
-    - "IPL-CLUSTER_LINK_LOCAL"           # Link-local between clustered DBs
-    - "IPL-MAINFRAME_*"                  # IPL-MAINFRAME_PD, _DV
-    - "IPL-GUARDIUM-100028"              # Appliance
+    - "IPL-ADMIN_VDI"
+      # Expected traffic path (Admin VDI is the approved access method)
+    - "IPL-CLUSTER_LINK_LOCAL"
+      # Link-local IPs between clustered databases. By protocol, not
+      # routable outside the VLAN — not end-user traffic.
+    - "IPL-MAINFRAME_*"
+      # Covers IPL-MAINFRAME_PD, IPL-MAINFRAME_DV. Traffic initiated
+      # from the mainframe — not end-user traffic.
+    - "IPL-GUARDIUM-100028"
+      # Appliances — not end-user traffic.
     - "IPL-IPT_VOICE_INFRASTRUCTURE_CORE_DATA_CENTER_NETWORKS"
-    - "IPL-LOAD_BALANCERS"               # Appliance
-    - "IPL-WEB_DMZ_DC1G2"               # Appliance
-    - "IPL-WEB_DMZ_DC2"                 # Appliance
-    - "IPL-WEB_DMZ_LTM_PD-900055"       # Appliance
-    - "IPL-INTERNAL_LTM_PD-900055"       # Appliance
+      # Appliances — not end-user traffic.
+    - "IPL-LOAD_BALANCERS"
+      # Appliances — not end-user traffic.
+    - "IPL-WEB_DMZ_DC1G2"
+      # Appliances — not end-user traffic.
+    - "IPL-WEB_DMZ_DC2"
+      # Appliances — not end-user traffic.
+    - "IPL-WEB_DMZ_LTM_PD-900055"
+      # Appliances — not end-user traffic.
+    - "IPL-INTERNAL_LTM_PD-900055"
+      # Appliances — not end-user traffic.
 
-  excluded_labels:
-    - "A-*"              # Application labels — always permitted
-    - "E-*"              # Environment labels — always permitted
-    - "R-METTLE-CI"      # Specific permitted role label
-    - "METTLECI-*"       # METTLECI correlation labels
+  excluded_labels:    # Labels
+    - "A-*"
+      # Application labels — app-to-app or app-originated traffic is permitted.
+    - "E-*"
+      # Environment labels — environment-scoped traffic is permitted.
+    - "R-METTLE-CI"
+      # Specific permitted role label.
+    - "METTLECI-*"
+      # METTLECI correlation labels.
 
   excluded_label_groups:
     - "LG-E-NON_QUARANTINE"
     - "LG-E-NON_PRODUCTION_ENVIRONMENTS"
 
-  # ----- EUC (flagged for REVIEW, not auto-excluded) -----
+  # -----------------------------------------------------------------------
+  # EUC PATTERNS — End User Compute
+  # -----------------------------------------------------------------------
+  # Sources matching these patterns are NOT auto-excluded even though they
+  # match A-*. They are placed in "Requires Review" because
+  # A-END_USER_COMPUTE_(EUC) contains end-user laptop listings that should
+  # be reviewed for access outside IPL-ADMIN_VDI.
+  #
+  # The EUC check runs BEFORE the A-* exclusion in the decision engine.
+  # -----------------------------------------------------------------------
   euc_patterns:
     - "A-END_USER_COMPUTE_*"
 
+  # -----------------------------------------------------------------------
+  # DECISION FILTER CHAIN (for reference)
+  # -----------------------------------------------------------------------
+  # Step 1: Strip excluded sources (IPLs, A-*, E-*, All Workloads, LGs)
+  #         — preserve EUC (A-END_USER_COMPUTE_*) for review
+  # Step 2: No sources remain → Excluded (all sources were permitted)
+  # Step 3: EUC remains → Requires Review (end-user laptops)
+  # Step 4: Non-excluded IPL- remains → Non-Compliant (finding)
+  # Step 5: All remaining A-*/E-* → Excluded (app-to-app permitted)
+  # Step 6: Only label groups remain → Requires Review (edge case)
+  # Step 7: Everything else (R-*, other) → Non-Compliant
+  # -----------------------------------------------------------------------
+
 output:
+  # EDR team shared folder for Splunk input lookup (illumio_ruleset.csv)
+  # PoC: Seth Jones, Mike Morfin
   # edr_export_path: "/path/to/shared/folder/illumio_ruleset.csv"
   edr_columns:
     - "Scopes"
