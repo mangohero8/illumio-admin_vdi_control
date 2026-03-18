@@ -1,110 +1,47 @@
 #!/usr/bin/env python3
 """
-Illumio Admin VDI Control Test — Automated Compliance Scanner
-Control: MON.C9.9 - Admin VDI Restrictions
+MON.C9.9 — Admin VDI Control Test (Automated)
+Illumio Admin VDI Restrictions Compliance Scanner
 
-Automates the manual control test procedure for identifying non-compliant
-admin VDI rules in Illumio PCE. Scans Production extra-scope rulesets for
-rules allowing traffic over administrative ports from non-permitted sources.
+# Steps:
+# 1. Fetch all required data from Illumio API endpoints.
+# 2. Build lookup maps for labels, label groups, IP lists, and services.
+# 3. Iterate through all rulesets and rules, mapping sources/destinations as per Illumio UI.
+# 4. Apply filters and output to CSV and Excel, with audit decision columns.
+# 5. Write rules with blank sources/destinations to a separate JSON for further review.
+# 6. Provide post-processing for audit evidence and optional filtering.
 
-Decision Filter Chain (mirrors manual guide):
-  Step 1: Remove non-end-user policy objects (permitted IPLs/labels)
-  Step 2: Flag rules with no remaining sources as EXCLUDED
-  Step 3: Flag A-END_USER_COMPUTE_[EUC] sources for MANUAL REVIEW
-  Step 4: Flag remaining IPL- sources for MANUAL REVIEW
-  Step 5: Exclude app-to-app (A- to A-) traffic as PERMITTED
-  Step 6: Check edge cases (env label groups applying broadly)
-  Step 7: Remaining rules = NON-COMPLIANT
-
-Outputs: Excel report with Audit Summary, Non-Compliant, Requires Review,
-         Compliant/Excluded, and Execution Log sheets.
-
-Version: 2.0.0
-Author: Cybersecurity Tech Ops — Illuminati Team
+Version: 1.0.0
 """
 
-__version__ = "2.0.0"
+__version__ = "3.0.0"
 
+import requests
+import csv
+import logging
 import os
 import sys
-import csv
+import json
+import time
 import hashlib
 import getpass
-import logging
 import platform
 import argparse
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
 
 import yaml
-import requests
+import urllib3
 from requests.auth import HTTPBasicAuth
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
-import urllib3
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-
-# =============================================================================
-# CONSTANTS
-# =============================================================================
-
 CONTROL_ID = "MON.C9.9"
 CONTROL_NAME = "Admin VDI Restrictions"
-DEFAULT_CONFIG_PATH = "config.yaml"
-
-# Decision Filter categories
-DECISION_EXCLUDE_NO_SOURCES = "Exclude – No Remaining Sources With Access"
-DECISION_EXCLUDE_APP_TO_APP = "Exclude – Application to Application Traffic is Permitted"
-DECISION_EXCLUDE_PERMITTED_SOURCE = "Exclude – All Sources Are Permitted Policy Objects"
-DECISION_REVIEW_EUC = "Keep for Review – Contains A-END_USER_COMPUTE_[EUC]"
-DECISION_REVIEW_IPL = "Keep for Review – Contains an IP List"
-DECISION_REVIEW_EDGE_CASE = "Keep for Review – Edge Case (Environment/Label Group Only)"
-DECISION_NON_COMPLIANT = "Non-Compliant – Unpermitted Source on Restricted Port"
-
-
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
-
-def load_config(config_path: str = DEFAULT_CONFIG_PATH) -> dict:
-    """
-    Load configuration from YAML with environment variable overrides.
-
-    Env var precedence:
-        ILLUMIO_API_USER, ILLUMIO_API_KEY, ILLUMIO_FQDN,
-        ILLUMIO_PORT, ILLUMIO_ORG_ID
-    """
-    config = {}
-    config_file = Path(config_path)
-    if config_file.exists():
-        with open(config_file, "r") as f:
-            config = yaml.safe_load(f) or {}
-        logging.info(f"Loaded configuration from {config_path}")
-    else:
-        logging.warning(f"Config file not found: {config_path}. Using env vars only.")
-
-    pce = config.get("pce", {})
-    config["_pce"] = {
-        "fqdn": os.environ.get("ILLUMIO_FQDN", pce.get("fqdn", "")),
-        "port": os.environ.get("ILLUMIO_PORT", str(pce.get("port", "8443"))),
-        "org_id": os.environ.get("ILLUMIO_ORG_ID", str(pce.get("org_id", "1"))),
-        "api_user": os.environ.get("ILLUMIO_API_USER", pce.get("api_user", "")),
-        "api_key": os.environ.get("ILLUMIO_API_KEY", pce.get("api_key", "")),
-    }
-
-    missing = [k for k, v in config["_pce"].items()
-               if not v and k in ("fqdn", "api_user", "api_key")]
-    if missing:
-        raise ValueError(
-            f"Missing required PCE config: {', '.join(missing)}. "
-            f"Set via config.yaml or environment variables."
-        )
-
-    return config
+DEFAULT_CONFIG = "config.yaml"
 
 
 # =============================================================================
@@ -112,822 +49,487 @@ def load_config(config_path: str = DEFAULT_CONFIG_PATH) -> dict:
 # =============================================================================
 
 class LogCapture(logging.Handler):
-    """Captures log records for embedding in the Excel report."""
-
+    """Captures log records for embedding in Excel report."""
     def __init__(self):
         super().__init__()
-        self.records: list[dict] = []
-
+        self.records = []
     def emit(self, record):
         self.records.append({
-            "timestamp": datetime.fromtimestamp(record.created).strftime(
-                "%Y-%m-%d %H:%M:%S"
-            ),
+            "timestamp": datetime.fromtimestamp(record.created).strftime("%Y-%m-%d %H:%M:%S"),
             "level": record.levelname,
             "message": self.format(record),
         })
 
 
-def setup_logging(log_file: str = "vdi_control_test.log") -> LogCapture:
-    """Configure file, console, and capture logging handlers."""
-    log_capture = LogCapture()
-    log_capture.setLevel(logging.DEBUG)
-    log_capture.setFormatter(logging.Formatter("%(message)s"))
-
-    file_handler = logging.FileHandler(log_file, mode="a")
-    file_handler.setLevel(logging.DEBUG)
-    file_handler.setFormatter(
-        logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-    )
-
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(logging.INFO)
-    console_handler.setFormatter(
-        logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-    )
-
+def setup_logging(log_file=None):
+    if log_file is None:
+        log_file = f"illumio_admin_vdi_log_{time.strftime('%d-%m-%Y')}.txt"
+    cap = LogCapture()
+    cap.setLevel(logging.DEBUG)
+    cap.setFormatter(logging.Formatter("%(message)s"))
+    fh = logging.FileHandler(log_file, mode="a")
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
     root = logging.getLogger()
     root.setLevel(logging.DEBUG)
-    root.addHandler(file_handler)
-    root.addHandler(console_handler)
-    root.addHandler(log_capture)
-
-    return log_capture
+    root.addHandler(fh)
+    root.addHandler(ch)
+    root.addHandler(cap)
+    return cap
 
 
 # =============================================================================
-# ILLUMIO API CLIENT
+# CONFIGURATION
 # =============================================================================
 
-class IllumioAPIClient:
-    """REST client for Illumio PCE API v2."""
+def load_config(path=DEFAULT_CONFIG):
+    config = {}
+    if Path(path).exists():
+        with open(path) as f:
+            config = yaml.safe_load(f) or {}
+        logging.info(f"Loaded configuration from {path}")
+    else:
+        logging.warning(f"Config file not found: {path}")
 
-    def __init__(self, fqdn, port, org_id, api_user, api_key):
-        self.base_url = f"https://{fqdn}:{port}/api/v2/orgs/{org_id}"
-        self.auth = HTTPBasicAuth(api_user, api_key)
-        self.session = requests.Session()
-        self.session.verify = False
-        self.session.auth = self.auth
-        self.session.headers.update({"Accept": "application/json"})
-        self.fqdn = fqdn
-        self.org_id = org_id
+    pce = config.get("pce", {})
+    config["_pce"] = {
+        "fqdn": os.environ.get("ILLUMIO_FQDN", pce.get("fqdn", "")),
+        "port": os.environ.get("ILLUMIO_PORT", str(pce.get("port", "443"))),
+        "org_id": os.environ.get("ILLUMIO_ORG_ID", str(pce.get("org_id", ""))),
+        "api_user": os.environ.get("ILLUMIO_API_USER", pce.get("api_user", "")),
+        "api_key": os.environ.get("ILLUMIO_API_KEY", pce.get("api_key", "")),
+    }
+    missing = [k for k in ("fqdn", "org_id", "api_user", "api_key") if not config["_pce"][k]]
+    if missing:
+        raise ValueError(f"Missing PCE config: {', '.join(missing)}")
+    return config
 
-    def _get(self, endpoint: str, params: Optional[dict] = None) -> list | dict:
-        """GET with retry logic (3 attempts)."""
-        url = f"{self.base_url}{endpoint}"
-        for attempt in range(1, 4):
-            try:
-                logging.debug(f"API GET {url} (attempt {attempt}/3)")
-                resp = self.session.get(url, params=params, timeout=60)
-                resp.raise_for_status()
-                return resp.json()
-            except requests.exceptions.HTTPError as e:
-                logging.error(f"HTTP {resp.status_code} on {url}: {e}")
-                if attempt == 3:
-                    raise
-            except requests.exceptions.ConnectionError as e:
-                logging.error(f"Connection error on {url}: {e}")
-                if attempt == 3:
-                    raise
-            except requests.exceptions.Timeout:
-                logging.warning(f"Timeout on {url}, retrying...")
-                if attempt == 3:
-                    raise
 
-    def get_services(self) -> list:
-        logging.info("Fetching active services...")
-        result = self._get("/sec_policy/active/services")
-        items = result if isinstance(result, list) else result.get("items", [])
-        logging.info(f"Retrieved {len(items)} services")
+# =============================================================================
+# ILLUMIO API — PROVEN FETCH LOGIC
+# =============================================================================
+
+def fetch_items(url, api_user, api_key):
+    """Fetch all items from an Illumio API endpoint (max_results in URL)."""
+    logging.info(f"Fetching items from URL: {url}")
+    try:
+        resp = requests.get(url, verify=False,
+                            headers={"Accept": "application/json"},
+                            auth=HTTPBasicAuth(api_user, api_key),
+                            timeout=120)
+        resp.raise_for_status()
+        items = resp.json()
+        if isinstance(items, dict) and "items" in items:
+            items = items["items"]
+        logging.info(f"Successfully fetched {len(items)} items from {url}")
         return items
-
-    def get_rulesets(self, params: Optional[dict] = None) -> list:
-        logging.info("Fetching active rulesets...")
-        result = self._get("/sec_policy/active/rule_sets", params=params)
-        items = result if isinstance(result, list) else result.get("items", [])
-        logging.info(f"Retrieved {len(items)} rulesets")
-        return items
-
-    def get_ip_lists(self) -> list:
-        logging.info("Fetching IP lists...")
-        result = self._get("/sec_policy/active/ip_lists")
-        items = result if isinstance(result, list) else result.get("items", [])
-        logging.info(f"Retrieved {len(items)} IP lists")
-        return items
-
-    def get_labels(self) -> list:
-        logging.info("Fetching labels...")
-        result = self._get("/labels")
-        items = result if isinstance(result, list) else result.get("items", [])
-        logging.info(f"Retrieved {len(items)} labels")
-        return items
-
-    def get_label_groups(self) -> list:
-        logging.info("Fetching label groups...")
-        result = self._get("/sec_policy/active/label_groups")
-        items = result if isinstance(result, list) else result.get("items", [])
-        logging.info(f"Retrieved {len(items)} label groups")
-        return items
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Error fetching items from {url}: {e}")
+        raise
 
 
-# =============================================================================
-# SERVICE RESOLUTION
-# =============================================================================
-
-def identify_restricted_services(
-    services: list,
-    restricted_ports: list[dict],
-) -> dict:
-    """
-    Identify services containing any restricted port/protocol combination.
-    Returns dict: service_href -> service_name.
-
-    restricted_ports format: [{"port": 22, "proto": 6}, ...]
-    """
-    port_numbers = [rp["port"] for rp in restricted_ports]
-    logging.info(f"Scanning services for restricted ports: {port_numbers}")
-    restricted = {}
-
-    for svc in services:
-        for port_info in svc.get("service_ports", []):
-            port = port_info.get("port")
-            to_port = port_info.get("to_port")
-
-            if port and to_port:
-                if any(port <= rp <= to_port for rp in port_numbers):
-                    restricted[svc.get("href", "")] = svc.get("name", "Unknown")
-                    break
-            elif port and port in port_numbers:
-                restricted[svc.get("href", "")] = svc.get("name", "Unknown")
-                break
-
-    logging.info(f"Found {len(restricted)} services with restricted ports")
-    return restricted
-
-
-# =============================================================================
-# HREF RESOLUTION
-# =============================================================================
-
-def build_href_lookup(labels: list, ip_lists: list, label_groups: list = None) -> dict:
-    """Build href -> metadata lookup for labels, IP lists, and label groups."""
-    lookup = {}
-
+def build_label_map(base_url, api_user, api_key):
+    """Build href → label value map. Only stores A-, R-, E-, L- prefixed labels."""
+    logging.info("Building label map...")
+    labels = fetch_items(f"{base_url}/labels?max_results=100000", api_user, api_key)
+    allowed_prefixes = ("A-", "R-", "E-", "L-")
+    label_map = {}
     for label in labels:
-        href = label.get("href", "")
-        lookup[href] = {
-            "name": label.get("value", label.get("name", "Unknown")),
-            "key": label.get("key", ""),
-            "type": "label",
-        }
-
-    for ipl in ip_lists:
-        href = ipl.get("href", "")
-        lookup[href] = {
-            "name": ipl.get("name", "Unknown"),
-            "key": "ip_list",
-            "type": "ip_list",
-        }
-
-    for lg in (label_groups or []):
-        href = lg.get("href", "")
-        lookup[href] = {
-            "name": lg.get("name", "Unknown"),
-            "key": lg.get("key", ""),
-            "type": "label_group",
-        }
-
-    logging.info(f"Built href lookup: {len(lookup)} entries")
-    return lookup
+        val = label.get("value", "")
+        if any(val.startswith(p) for p in allowed_prefixes):
+            label_map[label["href"]] = val
+    return label_map
 
 
-def resolve_actors(actors: list, href_lookup: dict) -> list[dict]:
-    """Resolve rule actors (providers/consumers) to readable form."""
-    resolved = []
-    for actor in actors:
-        if not isinstance(actor, dict):
-            resolved.append({"name": str(actor), "type": "unknown", "href": "", "key": ""})
-            continue
-
-        if "actors" in actor:
-            resolved.append({
-                "name": actor["actors"],
-                "type": "actors",
-                "href": "",
-                "key": "",
-            })
-        elif "label" in actor:
-            href = actor["label"].get("href", "")
-            info = href_lookup.get(href, {"name": href, "key": "unknown", "type": "label"})
-            resolved.append({
-                "name": info["name"],
-                "type": "label",
-                "key": info.get("key", ""),
-                "href": href,
-            })
-        elif "label_group" in actor:
-            href = actor["label_group"].get("href", "")
-            info = href_lookup.get(href, {"name": href, "key": "unknown", "type": "label_group"})
-            resolved.append({
-                "name": info["name"],
-                "type": "label_group",
-                "key": info.get("key", ""),
-                "href": href,
-            })
-        elif "ip_list" in actor:
-            href = actor["ip_list"].get("href", "")
-            info = href_lookup.get(href, {"name": href, "type": "ip_list"})
-            resolved.append({
-                "name": info["name"],
-                "type": "ip_list",
-                "key": "ip_list",
-                "href": href,
-            })
-        elif "workload" in actor:
-            href = actor["workload"].get("href", "")
-            resolved.append({
-                "name": href,
-                "type": "workload",
-                "key": "",
-                "href": href,
-            })
-        else:
-            resolved.append({"name": str(actor), "type": "unknown", "href": "", "key": ""})
-
-    return resolved
+def build_label_group_map(base_url, api_user, api_key):
+    """Build label_value → set of group names. Uses draft endpoint."""
+    logging.info("Building label group map...")
+    label_groups = fetch_items(
+        f"{base_url}/sec_policy/draft/label_groups?max_results=100000",
+        api_user, api_key
+    )
+    lv_to_groups = {}
+    for lg in label_groups:
+        group_name = lg.get("name", "")
+        for lbl in lg.get("labels", []):
+            val = lbl.get("value", "")
+            if val:
+                lv_to_groups.setdefault(val, set()).add(group_name)
+    return lv_to_groups
 
 
-def check_services_restricted(
-    ingress_services: list,
-    restricted_services: dict,
-    restricted_ports: list[dict],
-) -> tuple[list[str], bool]:
-    """
-    Resolve services and check if any are restricted.
-    Returns (service_name_list, is_restricted_bool).
-    """
-    names = []
-    is_restricted = False
-    port_numbers = [rp["port"] for rp in restricted_ports]
+def build_ip_list_map(base_url, api_user, api_key):
+    """Build href → IP list name. Uses draft endpoint, maps both draft and active hrefs."""
+    logging.info("Building IP list map...")
+    ip_lists = fetch_items(
+        f"{base_url}/sec_policy/draft/ip_lists?max_results=100000",
+        api_user, api_key
+    )
+    ip_map = {}
+    for ip in ip_lists:
+        href = ip["href"]
+        name = ip.get("name", "")
+        ip_map[href] = name
+        if "/draft/ip_lists/" in href:
+            ip_map[href.replace("/draft/ip_lists/", "/active/ip_lists/")] = name
+    return ip_map
 
+
+def build_service_map(base_url, api_user, api_key, restricted_ports):
+    """Build href → {name, ports, has_restricted}. Active endpoint."""
+    logging.info("Building service map...")
+    services = fetch_items(
+        f"{base_url}/sec_policy/active/services?max_results=100000",
+        api_user, api_key
+    )
+    svc_map = {}
+    for svc in services:
+        name = svc.get("name", "")
+        ports = []
+        for sp in svc.get("service_ports", []):
+            if "port" in sp and "to_port" in sp:
+                ports.append(f"{int(sp['port'])}-{int(sp['to_port'])}")
+            elif "port" in sp:
+                ports.append(str(int(sp["port"])))
+        has_restricted = any(p in restricted_ports for p in ports)
+        # Also check port ranges
+        if not has_restricted:
+            for p in ports:
+                if "-" in p:
+                    lo, hi = p.split("-")
+                    if any(int(lo) <= int(rp) <= int(hi) for rp in restricted_ports):
+                        has_restricted = True
+                        break
+        svc_map[svc["href"]] = {"name": name, "ports": ports, "has_restricted": has_restricted}
+    rcount = sum(1 for v in svc_map.values() if v["has_restricted"])
+    logging.info(f"Scanning services for restricted ports: {restricted_ports}")
+    logging.info(f"Found {rcount} services with restricted ports")
+    return svc_map
+
+
+def fetch_rulesets(base_url, api_user, api_key):
+    logging.info("Fetching all rulesets...")
+    return fetch_items(f"{base_url}/sec_policy/active/rule_sets?max_results=100000", api_user, api_key)
+
+
+# =============================================================================
+# RESOLVE ACTORS — MATCHING PROVEN LOGIC
+# =============================================================================
+
+def resolve_sources(consumers, label_map, ip_list_map, lv_to_groups):
+    """Resolve rule consumers to source names and label groups. Matches working script."""
+    sources = []
+    source_lgs = set()
+    for src in consumers:
+        if "actors" in src:
+            if src["actors"] == "ams":
+                sources.append("All Workloads")
+                logging.info("Rule source includes All Workloads (ams).")
+            else:
+                sources.append(f"actors:{src['actors']}")
+        if "ip_list" in src:
+            href = src["ip_list"].get("href", "")
+            name = ip_list_map.get(href, "")
+            sources.append(name if name else href)
+        if "label" in src:
+            href = src["label"].get("href", "") if src["label"] else ""
+            val = label_map.get(href, "") if href else ""
+            if val:
+                sources.append(val)
+                for g in lv_to_groups.get(val, []):
+                    source_lgs.add(g)
+        if "label_group" in src:
+            # Label groups resolved via label membership, not directly
+            pass
+    return sources, source_lgs
+
+
+def resolve_destinations(providers, label_map, ip_list_map, lv_to_groups):
+    """Resolve rule providers to destination names and label groups."""
+    dests = []
+    dest_lgs = set()
+    for dst in providers:
+        if "actors" in dst and dst["actors"] != "ams":
+            dests.append(f"actors:{dst['actors']}")
+        if "ip_list" in dst:
+            href = dst["ip_list"].get("href", "")
+            name = ip_list_map.get(href, "")
+            dests.append(name if name else href)
+        if "label" in dst:
+            href = dst["label"].get("href", "") if dst["label"] else ""
+            val = label_map.get(href, "") if href else ""
+            if val:
+                dests.append(val)
+                for g in lv_to_groups.get(val, []):
+                    dest_lgs.add(g)
+        if "label_group" in dst:
+            pass
+    return dests, dest_lgs
+
+
+def resolve_services(ingress_services, svc_map):
+    """Resolve services, returning only those with restricted ports."""
+    svc_names = []
     for svc in ingress_services:
-        if not isinstance(svc, dict):
-            names.append(str(svc))
-            continue
-
-        if "port" in svc:
-            port = svc["port"]
-            to_port = svc.get("to_port")
-            proto = svc.get("proto", "")
-            proto_str = {6: "TCP", 17: "UDP"}.get(proto, str(proto))
-
-            if to_port:
-                names.append(f"{proto_str}/{port}-{to_port}")
-                if any(port <= rp <= to_port for rp in port_numbers):
-                    is_restricted = True
-            else:
-                names.append(f"{proto_str}/{port}")
-                if port in port_numbers:
-                    is_restricted = True
-
-        elif "href" in svc:
-            href = svc["href"]
-            if href in restricted_services:
-                is_restricted = True
-                names.append(restricted_services[href])
-            else:
-                names.append(href.split("/")[-1])
-
-    return names, is_restricted
-
-
-# =============================================================================
-# PATTERN MATCHING
-# =============================================================================
-
-def matches_pattern(value: str, patterns: list[str]) -> bool:
-    """Check if value matches any pattern (supports trailing * wildcard)."""
-    for p in patterns:
-        if p.endswith("*"):
-            if value.startswith(p[:-1]):
-                return True
-        elif value == p:
-            return True
-    return False
+        info = svc_map.get(svc.get("href", ""), None)
+        if info and info["has_restricted"]:
+            svc_names.append(info["name"])
+    return svc_names
 
 
 # =============================================================================
 # DECISION FILTER ENGINE
 # =============================================================================
 
-class DecisionEngine:
-    """
-    Implements the full decision filter chain from the manual control test
-    guide (MON.C9.9 v1.2).
-
-    The chain processes sources through a series of filters, mirroring the
-    manual step-by-step procedure:
-
-    1. Strip out non-end-user policy objects (permitted IPLs, labels, label groups)
-    2. If no sources remain → Excluded (all permitted)
-    3. If A-END_USER_COMPUTE_[EUC] present → Flag for review
-    4. If any IPL- sources remain → Flag for review
-    5. If remaining is app-to-app (A- src AND A- dst) → Excluded (permitted)
-    6. If only env labels / label groups remain → Edge case review
-    7. Everything else → Non-compliant
-    """
-
-    def __init__(self, config: dict):
-        compliance = config.get("compliance", {})
-        self.excluded_sources = compliance.get("excluded_sources", [])
-        self.excluded_labels = compliance.get("excluded_labels", [])
-        self.excluded_label_groups = compliance.get("excluded_label_groups", [])
-        self.euc_patterns = compliance.get("euc_patterns", ["A-END_USER_COMPUTE_*"])
-
-    def apply_decision_filters(
-        self,
-        sources: list[dict],
-        destinations: list[dict],
-    ) -> tuple[str, str, list[dict]]:
-        """
-        Apply the full decision filter chain to a rule's sources.
-
-        Returns:
-            (decision_category, decision_reason, remaining_sources)
-        """
-        # --- Step 1: Remove non-end-user policy objects ---
-        # IMPORTANT: EUC sources (A-END_USER_COMPUTE_*) must be preserved
-        # for review even though they match the general A-* exclusion pattern.
-        # We check EUC patterns first to prevent them from being silently excluded.
-        remaining = []
-        removed = []
-
-        for src in sources:
-            name = src["name"]
-            src_type = src["type"]
-
-            # PRESERVE EUC sources — do NOT exclude these even if they match A-*
-            is_euc = any(matches_pattern(name, [p]) for p in self.euc_patterns)
-            if is_euc:
-                remaining.append(src)
-                continue
-
-            # Excluded IP lists
-            if src_type == "ip_list" and matches_pattern(name, self.excluded_sources):
-                removed.append(f"{name} (permitted IPL)")
-                continue
-
-            # Excluded labels
-            if src_type == "label" and matches_pattern(name, self.excluded_labels):
-                removed.append(f"{name} (permitted label)")
-                continue
-
-            # Excluded label groups
-            if src_type == "label_group" and matches_pattern(name, self.excluded_label_groups):
-                removed.append(f"{name} (permitted label group)")
-                continue
-
-            # "All Workloads" actor
-            if src_type == "actors" and name == "All Workloads":
-                removed.append(f"{name} (permitted actor)")
-                continue
-
-            remaining.append(src)
-
-        if removed:
-            logging.debug(f"  Filtered out: {', '.join(removed)}")
-
-        # --- Step 2: No remaining sources → EXCLUDED ---
-        if not remaining:
-            return (
-                DECISION_EXCLUDE_PERMITTED_SOURCE,
-                f"All sources removed as permitted: {', '.join(removed)}",
-                remaining,
-            )
-
-        # --- Step 3: EUC sources → REVIEW ---
-        euc_sources = [
-            s for s in remaining
-            if any(matches_pattern(s["name"], [p]) for p in self.euc_patterns)
-        ]
-        if euc_sources:
-            euc_names = [s["name"] for s in euc_sources]
-            return (
-                DECISION_REVIEW_EUC,
-                f"Contains EUC source(s): {', '.join(euc_names)}. "
-                f"A-END_USER_COMPUTE contains end-user listings — "
-                f"review for access outside IPL-ADMIN_VDI.",
-                remaining,
-            )
-
-        # --- Step 4: Remaining IPL- sources → REVIEW ---
-        ipl_sources = [
-            s for s in remaining
-            if s["type"] == "ip_list" or s["name"].startswith("IPL-")
-        ]
-        if ipl_sources:
-            ipl_names = [s["name"] for s in ipl_sources]
-            return (
-                DECISION_REVIEW_IPL,
-                f"Contains non-excluded IP List(s): {', '.join(ipl_names)}",
-                remaining,
-            )
-
-        # --- Step 5: Categorize remaining sources ---
-        # At this point, A-* and E-* should already be stripped by Step 1
-        # (except EUC, caught in Step 3). Remaining sources are the ones
-        # we care about: R-* (role labels) and non-excluded IPL-* sources.
-        remaining_names = [s["name"] for s in remaining]
-
-        # Safety net: if somehow all remaining are A-* or E-* (shouldn't
-        # happen if config is correct), treat as app-to-app / env permitted
-        all_remaining_app_or_env = all(
-            n.startswith("A-") or n.startswith("E-")
-            for n in remaining_names
-        ) if remaining_names else False
-
-        if all_remaining_app_or_env:
-            return (
-                DECISION_EXCLUDE_APP_TO_APP,
-                f"All remaining sources are application/environment labels: "
-                f"{', '.join(remaining_names)}",
-                remaining,
-            )
-
-        # --- Step 6: Edge cases — only label groups remain → REVIEW ---
-        only_lg = all(
-            s["type"] == "label_group"
-            for s in remaining
-        )
-        if only_lg and remaining:
-            edge_names = [s["name"] for s in remaining]
-            return (
-                DECISION_REVIEW_EDGE_CASE,
-                f"Only label groups remaining: {', '.join(edge_names)}. "
-                f"These may apply broadly to all applications.",
-                remaining,
-            )
-
-        # --- Step 7: Non-compliant ---
-        # Remaining sources are R-* role labels, non-excluded IPLs,
-        # or other non-permitted sources on restricted ports
-        nc_names = [s["name"] for s in remaining]
-        source_types = []
-        for s in remaining:
-            if s["name"].startswith("R-"):
-                source_types.append(f"{s['name']} (role label)")
-            elif s["type"] == "ip_list" or s["name"].startswith("IPL-"):
-                source_types.append(f"{s['name']} (non-excluded IP list)")
-            else:
-                source_types.append(f"{s['name']} ({s['type']})")
-
-        return (
-            DECISION_NON_COMPLIANT,
-            f"Non-permitted source(s) on restricted port: {', '.join(source_types)}",
-            remaining,
-        )
-
-
-# =============================================================================
-# RULE EVALUATION
-# =============================================================================
-
-def evaluate_rule(
-    rule: dict,
-    ruleset_name: str,
-    ruleset_scopes: str,
-    href_lookup: dict,
-    restricted_services: dict,
-    restricted_ports: list[dict],
-    decision_engine: DecisionEngine,
-) -> dict:
-    """Evaluate a single rule through the decision filter chain."""
-    consumers = rule.get("consumers", [])
-    providers = rule.get("providers", [])
-    ingress_services = rule.get("ingress_services", [])
-
-    resolved_sources = resolve_actors(consumers, href_lookup)
-    resolved_destinations = resolve_actors(providers, href_lookup)
-    service_names, is_restricted = check_services_restricted(
-        ingress_services, restricted_services, restricted_ports
-    )
-
-    src_str = "; ".join(s["name"] for s in resolved_sources) or "N/A"
-    dst_str = "; ".join(d["name"] for d in resolved_destinations) or "N/A"
-    svc_str = "; ".join(service_names) or "N/A"
-
-    entry = {
-        "ruleset": ruleset_name,
-        "scopes": ruleset_scopes,
-        "rule_href": rule.get("href", "N/A"),
-        "sources_original": src_str,
-        "sources_remaining": "",
-        "destinations": dst_str,
-        "services": svc_str,
-        "enabled": rule.get("enabled", True),
-        "decision": "",
-        "decision_reason": "",
-    }
-
-    # Skip if no restricted ports
-    if not is_restricted:
-        entry["decision"] = "N/A – No Restricted Ports"
-        entry["decision_reason"] = "Rule does not contain restricted ports/services"
-        return entry
-
-    # Skip disabled rules
-    if not rule.get("enabled", True):
-        entry["decision"] = "N/A – Rule Disabled"
-        entry["decision_reason"] = "Disabled rules do not permit traffic"
-        return entry
-
-    # Run through decision filter chain
-    decision, reason, remaining = decision_engine.apply_decision_filters(
-        resolved_sources, resolved_destinations
-    )
-
-    entry["decision"] = decision
-    entry["decision_reason"] = reason
-    entry["sources_remaining"] = (
-        "; ".join(s["name"] for s in remaining) if remaining else "(none)"
-    )
-
-    return entry
-
-
-# =============================================================================
-# SCOPE HELPERS
-# =============================================================================
-
-def extract_scope_string(ruleset: dict, href_lookup: dict) -> str:
-    scope_parts = []
-    for scope_set in ruleset.get("scopes", []):
-        if isinstance(scope_set, list):
-            for entry in scope_set:
-                if isinstance(entry, dict):
-                    href = entry.get("label", {}).get("href", "")
-                    info = href_lookup.get(href, {"name": href, "key": "?"})
-                    scope_parts.append(f"{info.get('key', '')}:{info['name']}")
-    return " | ".join(scope_parts) or "Unscoped"
-
-
-def is_production_scope(
-    ruleset: dict, href_lookup: dict, prod_values: list[str]
-) -> bool:
-    prod_lower = [v.lower() for v in prod_values]
-    for scope_set in ruleset.get("scopes", []):
-        if isinstance(scope_set, list):
-            for entry in scope_set:
-                if isinstance(entry, dict):
-                    href = entry.get("label", {}).get("href", "")
-                    info = href_lookup.get(href, {})
-                    if (info.get("key") == "env"
-                            and info.get("name", "").lower() in prod_lower):
-                        return True
+def matches_pattern(value, patterns):
+    """Check if value matches any pattern (supports trailing * wildcard)."""
+    for p in patterns:
+        if p.endswith("*") and value.startswith(p[:-1]):
+            return True
+        elif value == p:
+            return True
     return False
 
 
-def is_extra_scope_rule(rule: dict) -> bool:
-    return rule.get("unscoped_consumers", False)
+def apply_decision_filters(sources_list, config):
+    """
+    Apply the full MON.C9.9 decision filter chain to a rule's source list.
+
+    Args:
+        sources_list: list of source name strings (already resolved)
+        config: full config dict
+
+    Returns:
+        (decision_str, reason_str, remaining_sources_list)
+    """
+    comp = config.get("compliance", {})
+    excluded_ipls = comp.get("excluded_sources", [])
+    excluded_labels = comp.get("excluded_labels", [])
+    excluded_lgs = comp.get("excluded_label_groups", [])
+    euc_patterns = comp.get("euc_patterns", ["A-END_USER_COMPUTE_*"])
+
+    remaining = []
+    removed = []
+
+    for src in sources_list:
+        # Preserve EUC BEFORE A-* exclusion
+        if any(matches_pattern(src, [p]) for p in euc_patterns):
+            remaining.append(src)
+            continue
+
+        # Excluded labels (A-*, E-*, R-METTLE-CI, etc.)
+        if matches_pattern(src, excluded_labels):
+            removed.append(src)
+            continue
+
+        # Excluded IPLs
+        if matches_pattern(src, excluded_ipls):
+            removed.append(src)
+            continue
+
+        # Excluded label groups
+        if matches_pattern(src, excluded_lgs):
+            removed.append(src)
+            continue
+
+        # All Workloads
+        if src == "All Workloads":
+            removed.append(src)
+            continue
+
+        remaining.append(src)
+
+    # Step 2: No remaining → Excluded
+    if not remaining:
+        return ("Exclude – No Remaining Sources With Access",
+                f"All sources permitted: {'; '.join(removed)}",
+                [])
+
+    # Step 3: EUC → Review
+    euc = [s for s in remaining if any(matches_pattern(s, [p]) for p in euc_patterns)]
+    if euc:
+        return ("Keep for Review – Contains A-END_USER_COMPUTE_(EUC)",
+                f"EUC: {'; '.join(euc)} — end-user laptops, review for access outside IPL-ADMIN_VDI",
+                remaining)
+
+    # Step 4: Non-excluded IPL- → Review
+    ipls = [s for s in remaining if s.startswith("IPL-")]
+    if ipls:
+        return ("Keep for Review – Contains an IP List",
+                f"Non-excluded IPL(s): {'; '.join(ipls)}",
+                remaining)
+
+    # Step 5: All A-*/E-* → Excluded (app-to-app / env safety net)
+    if all(s.startswith("A-") or s.startswith("E-") for s in remaining):
+        return ("Exclude – Application to Application Traffic is Permitted",
+                f"App/Env traffic: {'; '.join(remaining)}",
+                [])
+
+    # Step 6: Only label groups → Review
+    if all(s.startswith("LG-") for s in remaining):
+        return ("Keep for Review – Edge Case (Label Group Only)",
+                f"Only label groups: {'; '.join(remaining)}",
+                remaining)
+
+    # Step 7: Non-compliant
+    return ("Non-Compliant – Unpermitted Source on Restricted Port",
+            f"Non-permitted: {'; '.join(remaining)}",
+            remaining)
 
 
 # =============================================================================
-# API MODE
+# MAIN PROCESSING
 # =============================================================================
 
-def process_rulesets_api(
-    client: IllumioAPIClient, config: dict
-) -> tuple[list, list, list, dict]:
+def process_rulesets(config, target_cis=None):
     """
-    Pull and process rulesets from PCE API.
-    Returns: (non_compliant, needs_review, excluded, stats)
+    Main processing loop. Fetches all data from PCE, iterates rulesets/rules,
+    applies filters, and returns categorized results.
     """
-    compliance = config.get("compliance", {})
-    restricted_ports = compliance.get("restricted_ports", [
-        {"port": 22, "proto": 6},
-        {"port": 23, "proto": 6},
-        {"port": 3389, "proto": 6},
-        {"port": 3389, "proto": 17},
-        {"port": 7389, "proto": 6},
-    ])
-    prod_values = compliance.get("production_env_values", [
-        "Production", "Prod", "E-Production", "E-Prod",
-    ])
+    pce = config["_pce"]
+    comp = config.get("compliance", {})
+    restricted_ports = set(str(p) for p in comp.get("restricted_ports", ["22", "23", "3389", "7389"]))
 
-    # Fetch all data from PCE
-    services = client.get_services()
-    labels = client.get_labels()
-    ip_lists = client.get_ip_lists()
-    label_groups = client.get_label_groups()
-    rulesets = client.get_rulesets()
+    base_url = f"https://{pce['fqdn']}:{pce['port']}/api/v2/orgs/{pce['org_id']}"
+    api_user, api_key = pce["api_user"], pce["api_key"]
 
-    # Build lookups
-    href_lookup = build_href_lookup(labels, ip_lists, label_groups)
-    restricted_svc = identify_restricted_services(services, restricted_ports)
-    engine = DecisionEngine(config)
+    # Build all lookup maps (proven logic)
+    label_map = build_label_map(base_url, api_user, api_key)
+    lv_to_groups = build_label_group_map(base_url, api_user, api_key)
+    ip_list_map = build_ip_list_map(base_url, api_user, api_key)
+    svc_map = build_service_map(base_url, api_user, api_key, restricted_ports)
+    rulesets = fetch_rulesets(base_url, api_user, api_key)
 
-    non_compliant, needs_review, excluded = [], [], []
+    logging.info(f"Built href lookup: {len(label_map) + len(ip_list_map)} entries")
+
+    non_compliant, needs_review, excluded, blank_rules = [], [], [], []
     stats = {
-        "total_rulesets": len(rulesets),
-        "production_rulesets": 0,
-        "total_rules_scanned": 0,
-        "extra_scope_rules": 0,
-        "rules_with_restricted_ports": 0,
-        "non_compliant": 0,
-        "needs_review": 0,
-        "excluded": 0,
-        "skipped_non_production": 0,
-        "skipped_intra_scope": 0,
-        "skipped_disabled": 0,
-        "skipped_no_restricted_ports": 0,
+        "total_rulesets": len(rulesets), "production_rulesets": 0,
+        "total_rules": 0, "extra_scope": 0, "restricted_port_rules": 0,
+        "non_compliant": 0, "needs_review": 0, "excluded": 0,
+        "skip_non_epd": 0, "skip_intra": 0, "skip_disabled": 0,
+        "skip_no_restricted": 0, "blank_rules": 0,
     }
 
     for ruleset in rulesets:
-        rs_name = ruleset.get("name", "Unknown")
+        policy_name = ruleset.get("name", "")
+        # Resolve scopes to label values (no prefixes)
+        scopes_flat = []
+        for scope_group in ruleset.get("scopes", []):
+            for scope in scope_group:
+                label = scope.get("label", {})
+                href = label.get("href", "") if label else ""
+                val = label_map.get(href, "") if href else ""
+                if val:
+                    scopes_flat.append(val)
+        scopes_str = "; ".join(scopes_flat)
 
-        if not is_production_scope(ruleset, href_lookup, prod_values):
-            stats["skipped_non_production"] += 1
-            continue
-
-        stats["production_rulesets"] += 1
-        scope_str = extract_scope_string(ruleset, href_lookup)
         rules = ruleset.get("rules", [])
-        logging.info(f"Processing: {rs_name} ({len(rules)} rules)")
+        logging.info(f"Processing ruleset: {policy_name} with {len(rules)} rules.")
 
         for rule in rules:
-            stats["total_rules_scanned"] += 1
+            stats["total_rules"] += 1
 
-            if not is_extra_scope_rule(rule):
-                stats["skipped_intra_scope"] += 1
+            # Resolve sources, destinations, services
+            sources_list, source_lgs = resolve_sources(
+                rule.get("consumers", []), label_map, ip_list_map, lv_to_groups
+            )
+            dests_list, dest_lgs = resolve_destinations(
+                rule.get("providers", []), label_map, ip_list_map, lv_to_groups
+            )
+            svc_names = resolve_services(rule.get("ingress_services", []), svc_map)
+
+            sources_str = "; ".join(sources_list)
+            dests_str = "; ".join(dests_list)
+            svc_str = "; ".join(svc_names)
+            source_lgs_str = "; ".join(sorted(source_lgs))
+            dest_lgs_str = "; ".join(sorted(dest_lgs))
+
+            # Track blank sources/destinations
+            if not sources_str or not dests_str:
+                blank_rules.append({
+                    "policy_name": policy_name, "scopes": scopes_str,
+                    "rule_href": rule.get("href", ""),
+                })
+                stats["blank_rules"] += 1
+                logging.warning(f"Rule with blank sources or destinations in ruleset: {policy_name} | {scopes_str}")
+
+            # --- FILTERS (matching working script order) ---
+            enabled = rule.get("enabled")
+            if enabled is None:
+                enabled = ruleset.get("enabled")
+            if not enabled:
+                logging.info("Rule skipped: not enabled.")
+                stats["skip_disabled"] += 1
                 continue
 
-            stats["extra_scope_rules"] += 1
+            if not svc_names:
+                logging.info("Rule skipped: no restricted services.")
+                stats["skip_no_restricted"] += 1
+                continue
 
-            result = evaluate_rule(
-                rule, rs_name, scope_str, href_lookup,
-                restricted_svc, restricted_ports, engine,
-            )
+            if "E-PD" not in scopes_str:
+                logging.info("Rule skipped: not in E-PD scope.")
+                stats["skip_non_epd"] += 1
+                continue
 
-            decision = result["decision"]
+            stats["production_rulesets"] += 1  # counted per-rule that passes E-PD filter
+            stats["extra_scope"] += 1
+            stats["restricted_port_rules"] += 1
 
-            if decision.startswith("N/A"):
-                if "Disabled" in decision:
-                    stats["skipped_disabled"] += 1
+            # Build the rule entry
+            entry = {
+                "ruleset": policy_name,
+                "scopes": scopes_str,
+                "rule_href": rule.get("href", ""),
+                "sources": sources_str,
+                "sources_remaining": "",
+                "source_label_groups": source_lgs_str,
+                "destinations": dests_str,
+                "dest_label_groups": dest_lgs_str,
+                "services": svc_str,
+                "decision": "",
+                "reason": "",
+            }
+
+            # Target CI filtering (if specified)
+            if target_cis:
+                if not any(ci in scopes_str for ci in target_cis):
+                    # Not in target scope — still process but don't flag as target
+                    entry["target_ci"] = ""
                 else:
-                    stats["skipped_no_restricted_ports"] += 1
-                excluded.append(result)
+                    entry["target_ci"] = next(ci for ci in target_cis if ci in scopes_str)
+            else:
+                entry["target_ci"] = ""
+
+            # Apply decision filter chain
+            decision, reason, remaining = apply_decision_filters(sources_list, config)
+            entry["decision"] = decision
+            entry["reason"] = reason
+            entry["sources_remaining"] = "; ".join(remaining) if remaining else "(none)"
+
+            if decision.startswith("Exclude"):
+                logging.info(f"Rule skipped: {decision}")
+                excluded.append(entry)
                 stats["excluded"] += 1
-            elif decision.startswith("Exclude"):
-                stats["rules_with_restricted_ports"] += 1
-                excluded.append(result)
-                stats["excluded"] += 1
-            elif decision.startswith("Keep for Review"):
-                stats["rules_with_restricted_ports"] += 1
-                needs_review.append(result)
+            elif decision.startswith("Keep"):
+                logging.info(f"Rule flagged: {decision}")
+                needs_review.append(entry)
                 stats["needs_review"] += 1
             else:
-                stats["rules_with_restricted_ports"] += 1
-                non_compliant.append(result)
+                logging.warning(f"NON-COMPLIANT in {policy_name}: {reason}")
+                non_compliant.append(entry)
                 stats["non_compliant"] += 1
 
-    return non_compliant, needs_review, excluded, stats
-
-
-# =============================================================================
-# CSV FALLBACK MODE
-# =============================================================================
-
-def process_csv_fallback(
-    csv_path: str,
-    config: dict,
-    client: Optional[IllumioAPIClient] = None,
-) -> tuple[list, list, list, dict]:
-    """
-    Process rules from CSV export (fallback mode).
-    Uses API for service resolution if client is available.
-    """
-    compliance = config.get("compliance", {})
-    restricted_ports = compliance.get("restricted_ports", [
-        {"port": 22, "proto": 6}, {"port": 23, "proto": 6},
-        {"port": 3389, "proto": 6}, {"port": 3389, "proto": 17},
-        {"port": 7389, "proto": 6},
-    ])
-
-    logging.info(f"CSV Fallback: Reading {csv_path}")
-
-    restricted_svc_names = set()
-    if client:
-        try:
-            services = client.get_services()
-            svc_map = identify_restricted_services(services, restricted_ports)
-            restricted_svc_names = set(svc_map.values())
-        except Exception as e:
-            logging.warning(f"Could not fetch services for CSV mode: {e}")
-
-    port_numbers = [rp["port"] for rp in restricted_ports]
-
-    with open(csv_path, mode="r") as f:
-        rows = list(csv.DictReader(f))
-    logging.info(f"Read {len(rows)} rules from CSV")
-
-    engine = DecisionEngine(config)
-    non_compliant, needs_review, excluded = [], [], []
-    stats = {
-        "total_rulesets": "N/A (CSV)",
-        "production_rulesets": "N/A (CSV)",
-        "total_rules_scanned": len(rows),
-        "extra_scope_rules": len(rows),
-        "rules_with_restricted_ports": 0,
-        "non_compliant": 0,
-        "needs_review": 0,
-        "excluded": 0,
-        "skipped_non_production": 0,
-        "skipped_intra_scope": 0,
-        "skipped_disabled": 0,
-        "skipped_no_restricted_ports": 0,
-    }
-
-    for row in rows:
-        ruleset_name = row.get("ruleset_name", "")
-        if not ruleset_name:
-            continue
-
-        # Parse sources into structured format
-        src_labels = [s.strip() for s in row.get("src_labels", "").split(";") if s.strip()]
-        src_iplists = [s.strip() for s in row.get("src_iplists", "").split(";") if s.strip()]
-
-        sources = []
-        for s in src_labels:
-            key = "app" if s.startswith("A-") else "env" if s.startswith("E-") else "role" if s.startswith("R-") else "unknown"
-            sources.append({"name": s, "type": "label", "key": key, "href": ""})
-        for s in src_iplists:
-            sources.append({"name": s, "type": "ip_list", "key": "ip_list", "href": ""})
-
-        # Parse destinations
-        dst_labels = [d.strip() for d in row.get("dst_labels", "").split(";") if d.strip()]
-        dst_iplists = [d.strip() for d in row.get("dst_iplists", "").split(";") if d.strip()]
-
-        destinations = []
-        for d in dst_labels:
-            destinations.append({"name": d, "type": "label", "key": "", "href": ""})
-        for d in dst_iplists:
-            destinations.append({"name": d, "type": "ip_list", "key": "", "href": ""})
-
-        # Check services for restricted ports
-        svc_list = [s.strip() for s in row.get("services", "").split(";") if s.strip()]
-        contains_restricted = any(s in restricted_svc_names for s in svc_list)
-        if not contains_restricted:
-            for svc_name in svc_list:
-                for rp in port_numbers:
-                    if str(rp) in svc_name:
-                        contains_restricted = True
-                        break
-                if contains_restricted:
-                    break
-
-        scope_str = row.get("ruleset_scope", "").replace("app:", "").replace("env:", "")
-        src_str = "; ".join(s["name"] for s in sources)
-        dst_str = "; ".join(d["name"] for d in destinations)
-
-        entry = {
-            "ruleset": ruleset_name,
-            "scopes": scope_str,
-            "rule_href": "N/A (CSV)",
-            "sources_original": src_str,
-            "sources_remaining": "",
-            "destinations": dst_str,
-            "services": "; ".join(svc_list),
-            "enabled": True,
-            "decision": "",
-            "decision_reason": "",
-        }
-
-        if not contains_restricted:
-            entry["decision"] = "N/A – No Restricted Ports"
-            entry["decision_reason"] = "No restricted ports/services"
-            excluded.append(entry)
-            stats["excluded"] += 1
-            stats["skipped_no_restricted_ports"] += 1
-            continue
-
-        stats["rules_with_restricted_ports"] += 1
-
-        decision, reason, remaining = engine.apply_decision_filters(sources, destinations)
-        entry["decision"] = decision
-        entry["decision_reason"] = reason
-        entry["sources_remaining"] = (
-            "; ".join(s["name"] for s in remaining) if remaining else "(none)"
-        )
-
-        if decision.startswith("Exclude"):
-            excluded.append(entry)
-            stats["excluded"] += 1
-        elif decision.startswith("Keep for Review"):
-            needs_review.append(entry)
-            stats["needs_review"] += 1
-        else:
-            non_compliant.append(entry)
-            stats["non_compliant"] += 1
+    # Write blank rules JSON
+    if blank_rules:
+        blank_path = os.path.join(os.path.dirname(__file__) or ".", "illumio_blank_rules.json")
+        with open(blank_path, "w") as jf:
+            json.dump(blank_rules, jf, indent=2)
+        logging.info(f"Wrote {len(blank_rules)} blank rules to {blank_path}")
 
     return non_compliant, needs_review, excluded, stats
 
@@ -936,254 +538,208 @@ def process_csv_fallback(
 # EXCEL REPORT
 # =============================================================================
 
-HDR_FONT = Font(bold=True, color="FFFFFF", size=11)
-FILL_BLUE = PatternFill(start_color="2F5496", end_color="2F5496", fill_type="solid")
-FILL_RED = PatternFill(start_color="C00000", end_color="C00000", fill_type="solid")
-FILL_AMBER = PatternFill(start_color="BF8F00", end_color="BF8F00", fill_type="solid")
-FILL_GREEN = PatternFill(start_color="548235", end_color="548235", fill_type="solid")
-FILL_GRAY = PatternFill(start_color="404040", end_color="404040", fill_type="solid")
-PASS_BG = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")
-FAIL_BG = PatternFill(start_color="FCE4EC", end_color="FCE4EC", fill_type="solid")
-REVIEW_BG = PatternFill(start_color="FFF3CD", end_color="FFF3CD", fill_type="solid")
-THIN = Border(
-    left=Side(style="thin"), right=Side(style="thin"),
-    top=Side(style="thin"), bottom=Side(style="thin"),
-)
+HF = Font(bold=True, color="FFFFFF", size=11)
+F_RED = PatternFill(start_color="C00000", end_color="C00000", fill_type="solid")
+F_AMB = PatternFill(start_color="BF8F00", end_color="BF8F00", fill_type="solid")
+F_GRN = PatternFill(start_color="548235", end_color="548235", fill_type="solid")
+F_GRY = PatternFill(start_color="404040", end_color="404040", fill_type="solid")
+BG_PASS = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")
+BG_FAIL = PatternFill(start_color="FCE4EC", end_color="FCE4EC", fill_type="solid")
+BG_COND = PatternFill(start_color="FFF3CD", end_color="FFF3CD", fill_type="solid")
+THIN = Border(left=Side("thin"), right=Side("thin"), top=Side("thin"), bottom=Side("thin"))
 
-RULE_HEADERS = [
-    "Ruleset", "Scopes", "Rule HREF", "Sources (Original)",
-    "Sources (After Filter)", "Destinations", "Services",
+RULE_HDRS = [
+    "Ruleset", "Scopes", "Rule HREF",
+    "Sources (Original)", "Sources (After Filter)", "Source Label Groups",
+    "Destinations", "Dest Label Groups", "Destination Services",
     "Decision Filter", "Decision Reason",
 ]
 
 
-def style_header(ws, row: int, fill: PatternFill):
-    for cell in ws[row]:
-        cell.font = HDR_FONT
-        cell.fill = fill
-        cell.alignment = Alignment(horizontal="center", wrap_text=True)
-        cell.border = THIN
+def _style_hdr(ws, row, fill):
+    for c in ws[row]:
+        c.font = HF; c.fill = fill
+        c.alignment = Alignment(horizontal="center", wrap_text=True)
+        c.border = THIN
 
 
-def auto_width(ws, max_w=55):
-    for col_idx, col in enumerate(ws.columns, 1):
-        mx = max((len(str(c.value or "")) for c in col), default=8)
-        ws.column_dimensions[get_column_letter(col_idx)].width = min(mx + 2, max_w)
+def _auto_w(ws, mx=55):
+    for i, col in enumerate(ws.columns, 1):
+        w = max((len(str(c.value or "")) for c in col), default=8)
+        ws.column_dimensions[get_column_letter(i)].width = min(w + 2, mx)
 
 
-def write_rules_sheet(ws, rules: list[dict], fill: PatternFill, empty_msg: str):
-    ws.append(RULE_HEADERS)
-    style_header(ws, 1, fill)
-
+def _write_rules(ws, rules, fill, empty_msg):
+    ws.append(RULE_HDRS)
+    _style_hdr(ws, 1, fill)
     if not rules:
-        ws.append([empty_msg] + [""] * (len(RULE_HEADERS) - 1))
-        ws.cell(row=2, column=1).font = Font(italic=True, color="808080")
+        ws.append([empty_msg] + [""] * (len(RULE_HDRS) - 1))
+        ws.cell(2, 1).font = Font(italic=True, color="808080")
     else:
         for r in rules:
             ws.append([
-                r.get("ruleset", ""),
-                r.get("scopes", ""),
-                r.get("rule_href", ""),
-                r.get("sources_original", ""),
-                r.get("sources_remaining", ""),
-                r.get("destinations", ""),
+                r.get("ruleset", ""), r.get("scopes", ""), r.get("rule_href", ""),
+                r.get("sources", ""), r.get("sources_remaining", ""),
+                r.get("source_label_groups", ""),
+                r.get("destinations", ""), r.get("dest_label_groups", ""),
                 r.get("services", ""),
-                r.get("decision", ""),
-                r.get("decision_reason", ""),
+                r.get("decision", ""), r.get("reason", ""),
             ])
-    auto_width(ws)
+    _auto_w(ws)
 
 
-def format_port_display(ports_config: list) -> str:
-    """Format restricted ports for display in report."""
-    parts = []
-    for rp in ports_config:
-        if isinstance(rp, dict):
-            proto = {6: "TCP", 17: "UDP"}.get(rp.get("proto", 6), str(rp.get("proto", "?")))
-            parts.append(f"{rp['port']}/{proto}")
-        else:
-            parts.append(str(rp))
-    return ", ".join(parts)
-
-
-def generate_report(
-    non_compliant: list,
-    needs_review: list,
-    excluded: list,
-    stats: dict,
-    log_records: list,
-    config: dict,
-    output_path: str,
-    mode: str,
-) -> str:
-    """Generate the Excel compliance report with all sheets."""
+def generate_report(nc, rv, ex, stats, logs, config, out_path):
     wb = Workbook()
     pce = config["_pce"]
-    compliance = config.get("compliance", {})
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    user = getpass.getuser()
-    host = platform.node()
+    comp = config.get("compliance", {})
+    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    nc_ct, rv_ct = stats.get("non_compliant", 0), stats.get("needs_review", 0)
 
-    # ---- Sheet 1: Audit Summary ----
+    if nc_ct == 0 and rv_ct == 0:
+        result = "PASS — No non-compliant or review-pending rules"
+    elif nc_ct == 0:
+        result = f"CONDITIONAL — {rv_ct} rule(s) require manual review"
+    else:
+        result = f"FAIL — {nc_ct} non-compliant, {rv_ct} require review"
+
+    # --- Audit Summary ---
     ws = wb.active
     ws.title = "Audit Summary"
-
-    summary_rows = [
+    rows = [
         (f"{CONTROL_ID} — {CONTROL_NAME} — Control Test Report", ""),
         ("", ""),
         ("EXECUTION METADATA", ""),
         ("Script Version", __version__),
-        ("Control ID", CONTROL_ID),
-        ("Control Name", CONTROL_NAME),
-        ("Execution Timestamp", now),
-        ("Executed By", user),
-        ("Hostname", host),
+        ("Control", f"{CONTROL_ID} — {CONTROL_NAME}"),
+        ("Timestamp", now_utc),
+        ("Executed By", getpass.getuser()),
+        ("Hostname", platform.node()),
         ("PCE Target", pce["fqdn"]),
-        ("Organization ID", pce["org_id"]),
-        ("Data Source", f"{'Illumio API (Direct)' if mode == 'api' else 'CSV Fallback'}: {mode}"),
+        ("Org ID", pce["org_id"]),
+        ("Data Source", "Illumio API (Direct)"),
         ("", ""),
         ("SCAN SCOPE", ""),
-        ("Environment Filter", "Production"),
-        ("Rule Scope Filter", "Extra-Scope Only"),
-        ("Rule Status Filter", "Enabled Only"),
-        ("Restricted Ports", format_port_display(
-            compliance.get("restricted_ports", [])
-        )),
+        ("Environment", "E-PD (Production)"),
+        ("Rule Scope", "Extra-Scope (rules with restricted services in E-PD)"),
+        ("Rule Status", "Enabled Only"),
+        ("Restricted Ports", ", ".join(str(p) for p in comp.get("restricted_ports", []))),
         ("", ""),
         ("SCAN STATISTICS", ""),
-        ("Total Rulesets Fetched", stats.get("total_rulesets", "N/A")),
-        ("Production Rulesets Evaluated", stats.get("production_rulesets", "N/A")),
-        ("Skipped (Non-Production)", stats.get("skipped_non_production", 0)),
-        ("Total Rules Scanned", stats.get("total_rules_scanned", 0)),
-        ("Extra-Scope Rules Evaluated", stats.get("extra_scope_rules", 0)),
-        ("Skipped (Intra-Scope)", stats.get("skipped_intra_scope", 0)),
-        ("Skipped (Disabled)", stats.get("skipped_disabled", 0)),
-        ("Skipped (No Restricted Ports)", stats.get("skipped_no_restricted_ports", 0)),
-        ("Rules with Restricted Ports", stats.get("rules_with_restricted_ports", 0)),
+        ("Total Rulesets Fetched", stats.get("total_rulesets", 0)),
+        ("Rules in E-PD with Restricted Services", stats.get("restricted_port_rules", 0)),
+        ("Total Rules Scanned", stats.get("total_rules", 0)),
+        ("Skipped (Not E-PD)", stats.get("skip_non_epd", 0)),
+        ("Skipped (Not Enabled)", stats.get("skip_disabled", 0)),
+        ("Skipped (No Restricted Services)", stats.get("skip_no_restricted", 0)),
+        ("Blank Sources/Destinations", stats.get("blank_rules", 0)),
         ("", ""),
-        ("DECISION FILTER RESULTS", ""),
-        ("❌ Non-Compliant", stats.get("non_compliant", 0)),
-        ("⚠️  Requires Manual Review", stats.get("needs_review", 0)),
-        ("✅ Excluded / Compliant", stats.get("excluded", 0)),
+        ("DECISION RESULTS", ""),
+        ("Non-Compliant", nc_ct),
+        ("Requires Manual Review", rv_ct),
+        ("Excluded / Compliant", stats.get("excluded", 0)),
         ("", ""),
+        ("CONTROL TEST RESULT", result),
+        ("", ""),
+        ("DECISION FILTER CHAIN", ""),
+        ("Step 1", "Strip permitted: excluded IPLs, A-*, E-*, All Workloads, specific labels/LGs (preserve EUC)"),
+        ("Step 2", "No sources remain → Excluded (all sources were permitted)"),
+        ("Step 3", "A-END_USER_COMPUTE_(EUC) present → Requires Review"),
+        ("Step 4", "Non-excluded IPL- sources remain → Requires Review"),
+        ("Step 5", "All remaining A-*/E-* → Excluded (app-to-app permitted)"),
+        ("Step 6", "Only label groups remain → Requires Review (edge case)"),
+        ("Step 7", "Everything else (R-*, other) → Non-Compliant"),
+        ("", ""),
+        ("EXCLUDED SOURCES (config.yaml)", ""),
     ]
+    for s in comp.get("excluded_sources", []):
+        rows.append((f"  IPL: {s}", ""))
+    for s in comp.get("excluded_labels", []):
+        rows.append((f"  Label: {s}", ""))
+    for s in comp.get("excluded_label_groups", []):
+        rows.append((f"  LG: {s}", ""))
+    for s in comp.get("euc_patterns", []):
+        rows.append((f"  EUC (Review): {s}", ""))
 
-    nc = stats.get("non_compliant", 0)
-    rv = stats.get("needs_review", 0)
-    if nc == 0 and rv == 0:
-        result_text = "PASS — No non-compliant or review-pending rules found"
-    elif nc == 0 and rv > 0:
-        result_text = f"CONDITIONAL — {rv} rule(s) require manual review"
-    else:
-        result_text = f"FAIL — {nc} non-compliant rule(s) found, {rv} require review"
-
-    summary_rows.append(("CONTROL TEST RESULT", result_text))
-    summary_rows.append(("", ""))
-    summary_rows.append(("DECISION FILTER CHAIN (Applied in Order)", ""))
-    summary_rows.append(("Step 1", "Remove permitted sources: excluded IPLs, A-* labels, E-* labels, specific labels/LGs (preserving EUC for review)"))
-    summary_rows.append(("Step 2", "If no sources remain → Excluded (all sources permitted)"))
-    summary_rows.append(("Step 3", "If A-END_USER_COMPUTE_[EUC] present → Requires Review (end-user access)"))
-    summary_rows.append(("Step 4", "If non-excluded IPL- sources remain → Requires Review"))
-    summary_rows.append(("Step 5", "Safety net: if remaining are all A-*/E-* (config gap) → Excluded"))
-    summary_rows.append(("Step 6", "If only label groups remain → Edge case review"))
-    summary_rows.append(("Step 7", "Everything else (R-* role labels, other non-permitted) → Non-Compliant"))
-    summary_rows.append(("", ""))
-    summary_rows.append(("EXCLUDED SOURCES (from config.yaml)", ""))
-
-    for src in compliance.get("excluded_sources", []):
-        summary_rows.append((f"  IPL: {src}", ""))
-    for lbl in compliance.get("excluded_labels", []):
-        summary_rows.append((f"  Label: {lbl}", ""))
-    for lg in compliance.get("excluded_label_groups", []):
-        summary_rows.append((f"  Label Group: {lg}", ""))
-    for euc in compliance.get("euc_patterns", []):
-        summary_rows.append((f"  EUC Pattern (Review): {euc}", ""))
-
-    for row_data in summary_rows:
-        ws.append(row_data)
+    for r in rows:
+        ws.append(r)
 
     # Style
     ws["A1"].font = Font(bold=True, size=14)
-    section_labels = ["EXECUTION METADATA", "SCAN SCOPE", "SCAN STATISTICS",
-                      "DECISION FILTER RESULTS", "CONTROL TEST RESULT",
-                      "DECISION FILTER CHAIN", "EXCLUDED SOURCES"]
-    for row_cells in ws.iter_rows(min_row=1, max_row=ws.max_row, max_col=1):
-        for cell in row_cells:
-            val = str(cell.value or "")
-            if any(s in val for s in section_labels):
+    sections = ["EXECUTION METADATA", "SCAN SCOPE", "SCAN STATISTICS",
+                "DECISION RESULTS", "CONTROL TEST RESULT",
+                "DECISION FILTER CHAIN", "EXCLUDED SOURCES"]
+    for row in ws.iter_rows(max_col=1):
+        for cell in row:
+            v = str(cell.value or "")
+            if any(s in v for s in sections):
                 cell.font = Font(bold=True, size=12, color="2F5496")
-            if "CONTROL TEST RESULT" in val:
-                res_cell = ws.cell(row=cell.row, column=2)
-                if "PASS" in str(res_cell.value or ""):
-                    res_cell.fill = PASS_BG
-                    res_cell.font = Font(bold=True, color="548235", size=12)
-                elif "CONDITIONAL" in str(res_cell.value or ""):
-                    res_cell.fill = REVIEW_BG
-                    res_cell.font = Font(bold=True, color="BF8F00", size=12)
-                elif "FAIL" in str(res_cell.value or ""):
-                    res_cell.fill = FAIL_BG
-                    res_cell.font = Font(bold=True, color="C00000", size=12)
-
+            if "CONTROL TEST RESULT" in v:
+                rc = ws.cell(cell.row, 2)
+                rv_str = str(rc.value or "")
+                if "PASS" in rv_str:
+                    rc.fill = BG_PASS; rc.font = Font(bold=True, color="548235", size=12)
+                elif "CONDITIONAL" in rv_str:
+                    rc.fill = BG_COND; rc.font = Font(bold=True, color="BF8F00", size=12)
+                elif "FAIL" in rv_str:
+                    rc.fill = BG_FAIL; rc.font = Font(bold=True, color="C00000", size=12)
     ws.column_dimensions["A"].width = 45
     ws.column_dimensions["B"].width = 70
 
-    # ---- Sheet 2: Non-Compliant ----
-    ws_nc = wb.create_sheet("Non-Compliant")
-    write_rules_sheet(ws_nc, non_compliant, FILL_RED,
-                      "No non-compliant rules found — PASS")
+    # --- Data Sheets ---
+    _write_rules(wb.create_sheet("Non-Compliant"), nc, F_RED, "No non-compliant rules — PASS")
+    _write_rules(wb.create_sheet("Requires Review"), rv, F_AMB, "No rules require manual review")
+    _write_rules(wb.create_sheet("Excluded - Compliant"), ex, F_GRN, "No excluded rules")
 
-    # ---- Sheet 3: Requires Review ----
-    ws_rv = wb.create_sheet("Requires Review")
-    write_rules_sheet(ws_rv, needs_review, FILL_AMBER,
-                      "No rules require manual review")
+    # --- Execution Log ---
+    wl = wb.create_sheet("Execution Log")
+    wl.append(["Timestamp", "Level", "Message"])
+    _style_hdr(wl, 1, F_GRY)
+    for rec in logs:
+        wl.append([rec["timestamp"], rec["level"], rec["message"]])
+    _auto_w(wl)
 
-    # ---- Sheet 4: Excluded / Compliant ----
-    ws_ex = wb.create_sheet("Excluded - Compliant")
-    write_rules_sheet(ws_ex, excluded, FILL_GREEN,
-                      "No excluded/compliant rules")
-
-    # ---- Sheet 5: Execution Log ----
-    ws_log = wb.create_sheet("Execution Log")
-    ws_log.append(["Timestamp", "Level", "Message"])
-    style_header(ws_log, 1, FILL_GRAY)
-    for rec in log_records:
-        ws_log.append([rec["timestamp"], rec["level"], rec["message"]])
-    auto_width(ws_log)
-
-    # Save and hash
-    wb.save(output_path)
-    logging.info(f"Report saved: {output_path}")
-
-    with open(output_path, "rb") as f:
+    wb.save(out_path)
+    with open(out_path, "rb") as f:
         sha = hashlib.sha256(f.read()).hexdigest()
-    logging.info(f"SHA-256: {sha}")
-
+    logging.info(f"Report: {out_path} | SHA-256: {sha}")
     return sha
+
+
+# =============================================================================
+# EDR CSV EXPORT
+# =============================================================================
+
+def export_edr_csv(nc, path):
+    """Export non-compliant rules as flat CSV for Splunk ingest."""
+    cols = ["Scopes", "Sources", "Destinations", "Destination Services", "Ruleset"]
+    kmap = {"Scopes": "scopes", "Sources": "sources", "Destinations": "destinations",
+            "Destination Services": "services", "Ruleset": "ruleset"}
+    with open(path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=cols)
+        w.writeheader()
+        for r in nc:
+            w.writerow({c: r.get(kmap[c], "") for c in cols})
+    logging.info(f"EDR CSV: {path} ({len(nc)} rules)")
 
 
 # =============================================================================
 # MAIN
 # =============================================================================
 
-def parse_args():
+def main():
     parser = argparse.ArgumentParser(
-        description=f"{CONTROL_ID} — Admin VDI Control Test (Automated)",
+        description=f"{CONTROL_ID} — Admin VDI Control Test v{__version__}"
     )
-    parser.add_argument("--config", "-c", default=DEFAULT_CONFIG_PATH,
-                        help=f"Config YAML path (default: {DEFAULT_CONFIG_PATH})")
-    parser.add_argument("--csv", default=None,
-                        help="CSV file for fallback mode")
-    parser.add_argument("--output", "-o", default=None,
-                        help="Output Excel file path")
+    parser.add_argument("--config", "-c", default=DEFAULT_CONFIG)
+    parser.add_argument("--output", "-o", default=None, help="Excel report path")
+    parser.add_argument("--edr-export", default=None, help="EDR CSV path for Splunk")
+    parser.add_argument("--target-cis", default=None,
+                        help="Comma-separated Target CIs to filter by")
     parser.add_argument("--version", "-v", action="version",
                         version=f"%(prog)s {__version__}")
-    return parser.parse_args()
+    args = parser.parse_args()
 
-
-def main():
-    args = parse_args()
-    log_capture = setup_logging()
-
+    log_cap = setup_logging()
     logging.info("=" * 72)
     logging.info(f"{CONTROL_ID} — Admin VDI Control Test v{__version__}")
     logging.info("=" * 72)
@@ -1191,70 +747,57 @@ def main():
     try:
         config = load_config(args.config)
         pce = config["_pce"]
-        compliance = config.get("compliance", {})
+        comp = config.get("compliance", {})
 
-        logging.info(f"PCE: {pce['fqdn']} | Org: {pce['org_id']}")
-        logging.info(f"Restricted Ports: {format_port_display(compliance.get('restricted_ports', []))}")
+        logging.info(f"PCE: {pce['fqdn']}:{pce['port']} | Org: {pce['org_id']}")
+        logging.info(f"Restricted Ports: {comp.get('restricted_ports', [])}")
+        excl = (len(comp.get("excluded_sources", []))
+                + len(comp.get("excluded_labels", []))
+                + len(comp.get("excluded_label_groups", [])))
+        logging.info(f"Excluded source patterns: {excl}")
+        logging.info("Mode: Direct API pull from PCE")
 
-        excl_count = (len(compliance.get("excluded_sources", []))
-                      + len(compliance.get("excluded_labels", []))
-                      + len(compliance.get("excluded_label_groups", [])))
-        logging.info(f"Excluded source patterns: {excl_count}")
+        # Parse target CIs
+        target_cis = None
+        if args.target_cis:
+            target_cis = [ci.strip() for ci in args.target_cis.split(",") if ci.strip()]
+            logging.info(f"Target CIs: {target_cis}")
 
-        client = IllumioAPIClient(
-            pce["fqdn"], pce["port"], pce["org_id"],
-            pce["api_user"], pce["api_key"],
-        )
+        # Process
+        nc, rv, ex, stats = process_rulesets(config, target_cis)
 
-        if args.csv:
-            mode = f"csv:{args.csv}"
-            logging.info(f"Mode: CSV fallback ({args.csv})")
-            nc, rv, ex, stats = process_csv_fallback(args.csv, config, client)
-        else:
-            mode = "api"
-            logging.info("Mode: Direct API pull from PCE")
-            nc, rv, ex, stats = process_rulesets_api(client, config)
-
-        # Print results
+        # Results
         logging.info("=" * 72)
         logging.info("RESULTS")
-        logging.info(f"  Total Rules Scanned:       {stats.get('total_rules_scanned', 0)}")
-        logging.info(f"  Extra-Scope Evaluated:     {stats.get('extra_scope_rules', 0)}")
-        logging.info(f"  With Restricted Ports:     {stats.get('rules_with_restricted_ports', 0)}")
-        logging.info(f"  ❌ Non-Compliant:          {stats.get('non_compliant', 0)}")
-        logging.info(f"  ⚠️  Requires Review:       {stats.get('needs_review', 0)}")
-        logging.info(f"  ✅ Excluded / Compliant:   {stats.get('excluded', 0)}")
+        logging.info(f"  Total Rules Scanned:          {stats.get('total_rules', 0)}")
+        logging.info(f"  E-PD + Restricted Services:   {stats.get('restricted_port_rules', 0)}")
+        logging.info(f"  Non-Compliant:                {stats.get('non_compliant', 0)}")
+        logging.info(f"  Requires Review:              {stats.get('needs_review', 0)}")
+        logging.info(f"  Excluded:                     {stats.get('excluded', 0)}")
         logging.info("=" * 72)
 
-        nc_count = stats.get("non_compliant", 0)
-        rv_count = stats.get("needs_review", 0)
-
-        if nc_count == 0 and rv_count == 0:
-            logging.info("CONTROL TEST RESULT: PASS")
-        elif nc_count == 0:
-            logging.warning(f"CONTROL TEST RESULT: CONDITIONAL — {rv_count} rule(s) need review")
+        nc_ct = stats.get("non_compliant", 0)
+        rv_ct = stats.get("needs_review", 0)
+        if nc_ct == 0 and rv_ct == 0:
+            logging.info("RESULT: PASS")
+        elif nc_ct == 0:
+            logging.warning(f"RESULT: CONDITIONAL — {rv_ct} need review")
         else:
-            logging.error(f"CONTROL TEST RESULT: FAIL — {nc_count} non-compliant, {rv_count} need review")
+            logging.error(f"RESULT: FAIL — {nc_ct} non-compliant, {rv_ct} need review")
 
         # Generate report
-        if args.output:
-            out = args.output
-        else:
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            out = f"VDI_Control_Test_{CONTROL_ID}_{ts}.xlsx"
+        out = args.output or f"VDI_Control_Test_{CONTROL_ID}_{time.strftime('%Y%m%d_%H%M%S')}.xlsx"
+        generate_report(nc, rv, ex, stats, log_cap.records, config, out)
 
-        sha = generate_report(nc, rv, ex, stats, log_capture.records, config, out, mode)
+        # EDR export
+        edr = args.edr_export or config.get("output", {}).get("edr_export_path")
+        if edr and nc:
+            export_edr_csv(nc, edr)
+        elif edr:
+            logging.info("EDR export skipped — no non-compliant rules")
 
-        logging.info(f"Report: {out}")
-        logging.info(f"SHA-256: {sha}")
-        logging.info("Execution complete.")
-
-        # Exit codes: 0=pass, 1=fail, 2=error, 3=conditional
-        if nc_count > 0:
-            return 1
-        elif rv_count > 0:
-            return 3
-        return 0
+        logging.info("Script completed successfully.")
+        return 1 if nc_ct > 0 else (3 if rv_ct > 0 else 0)
 
     except Exception as e:
         logging.critical(f"FATAL: {e}", exc_info=True)
