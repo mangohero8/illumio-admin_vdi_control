@@ -3,15 +3,25 @@
 MON.C9.9 — Admin VDI Control Test (Automated)
 Illumio Admin VDI Restrictions Compliance Scanner
 
-# Steps:
-# 1. Fetch all required data from Illumio API endpoints.
-# 2. Build lookup maps for labels, label groups, IP lists, and services.
-# 3. Iterate through all rulesets and rules, mapping sources/destinations as per Illumio UI.
-# 4. Apply filters and output to CSV and Excel, with audit decision columns.
-# 5. Write rules with blank sources/destinations to a separate JSON for further review.
-# 6. Provide post-processing for audit evidence and optional filtering.
+Based on the proven working export script. Fetches rulesets, labels, label
+groups, IP lists, and services from the Illumio API, applies the MON.C9.9
+decision filter chain, and outputs a structured Excel audit report.
 
-Version: 1.0.0
+Control: MON.C9.9 - Admin VDI Restrictions
+Guide:   Admin VDI Control Test Execution v1.2
+
+Decision Filter Chain:
+  1. Strip non-end-user policy objects from sources
+     (permitted IPLs, A-*, E-*, All Workloads — preserve EUC)
+  2. No sources remain → Excluded (all sources were permitted)
+  3. EUC present → Requires Review (end-user laptops)
+  4. Non-excluded IPL- present → Non-Compliant (finding)
+  5. Remaining A-*/E-* only → Excluded (app-to-app permitted)
+  6. Only label groups remain → Requires Review (edge case)
+  7. Everything else (R-*, other) → Non-Compliant
+
+Version: 3.0.0
+Author: Cybersecurity Tech Ops — Illuminati Team
 """
 
 __version__ = "3.0.0"
@@ -355,10 +365,10 @@ def apply_decision_filters(sources_list, config):
                 f"EUC: {'; '.join(euc)} — end-user laptops, review for access outside IPL-ADMIN_VDI",
                 remaining)
 
-    # Step 4: Non-excluded IPL- → Review
+    # Step 4: Non-excluded IPL- → NON-COMPLIANT (any non-excluded IPL is a finding)
     ipls = [s for s in remaining if s.startswith("IPL-")]
     if ipls:
-        return ("Keep for Review – Contains an IP List",
+        return ("Non-Compliant – Non-Excluded IP List on Restricted Port",
                 f"Non-excluded IPL(s): {'; '.join(ipls)}",
                 remaining)
 
@@ -644,7 +654,7 @@ def generate_report(nc, rv, ex, stats, logs, config, out_path):
         ("Step 1", "Strip permitted: excluded IPLs, A-*, E-*, All Workloads, specific labels/LGs (preserve EUC)"),
         ("Step 2", "No sources remain → Excluded (all sources were permitted)"),
         ("Step 3", "A-END_USER_COMPUTE_(EUC) present → Requires Review"),
-        ("Step 4", "Non-excluded IPL- sources remain → Requires Review"),
+        ("Step 4", "Non-excluded IPL- sources remain → Non-Compliant (finding)"),
         ("Step 5", "All remaining A-*/E-* → Excluded (app-to-app permitted)"),
         ("Step 6", "Only label groups remain → Requires Review (edge case)"),
         ("Step 7", "Everything else (R-*, other) → Non-Compliant"),
