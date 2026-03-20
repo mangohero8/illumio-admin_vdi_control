@@ -107,6 +107,7 @@ compliance:
   # Step 3: EUC remains → Requires Review (end-user laptops)
   # Step 4: Non-excluded IPL- remains → Non-Compliant (finding)
   # Step 5: All remaining A-*/E-* → Excluded (app-to-app permitted)
+  # Step 5b: All remaining R-* → Excluded (intra-scope server-to-server)
   # Step 6: Only label groups remain → Requires Review (edge case)
   # Step 7: Everything else (R-*, other) → Non-Compliant
   # -----------------------------------------------------------------------
@@ -121,3 +122,14 @@ output:
     - "Destinations"
     - "Destination Services"
     - "Ruleset"
+
+# --- Workloader Integration (optional validation) ---
+# brian1917/workloader — https://github.com/brian1917/workloader
+# Download binary from releases, run "workloader pce-add" to configure auth.
+# Use --workloader flag to run validation against workloader rule-export.
+# Location: c:\Scripts\Illumio Workloader\workloader.exe
+workloader:
+  # Path to pce.yaml (workloader's auth config)
+  # config_file: "C:\\Scripts\\Illumio Workloader\\pce.yaml"
+  # PCE name override (if multiple PCEs configured in pce.yaml)
+  # pce_name: ""
