@@ -17,8 +17,9 @@ Decision Filter Chain:
   3. EUC present → Requires Review (end-user laptops)
   4. Non-excluded IPL- present → Non-Compliant (finding)
   5. Remaining A-*/E-* only → Excluded (app-to-app permitted)
+  5b. Remaining R-* only → Excluded (intra-scope server-to-server)
   6. Only label groups remain → Requires Review (edge case)
-  7. Everything else (R-*, other) → Non-Compliant
+  7. Everything else → Non-Compliant
 
 Version: 3.0.0
 Author: Cybersecurity Tech Ops — Illuminati Team
@@ -262,8 +263,11 @@ def resolve_destinations(providers, label_map, ip_list_map, lv_to_groups):
     dests = []
     dest_lgs = set()
     for dst in providers:
-        if "actors" in dst and dst["actors"] != "ams":
-            dests.append(f"actors:{dst['actors']}")
+        if "actors" in dst:
+            if dst["actors"] == "ams":
+                dests.append("All Workloads")
+            else:
+                dests.append(f"actors:{dst['actors']}")
         if "ip_list" in dst:
             href = dst["ip_list"].get("href", "")
             name = ip_list_map.get(href, "")
@@ -376,6 +380,15 @@ def apply_decision_filters(sources_list, config):
     if all(s.startswith("A-") or s.startswith("E-") for s in remaining):
         return ("Exclude – Application to Application Traffic is Permitted",
                 f"App/Env traffic: {'; '.join(remaining)}",
+                [])
+
+    # Step 5b: All R-* role labels → Excluded (intra-scope server-to-server)
+    # If every remaining source is a role label, this is intra-scope traffic
+    # between servers within the same application scope (e.g., R-APPLICATION
+    # → R-DATABASE). This is not external end-user access.
+    if all(s.startswith("R-") for s in remaining):
+        return ("Exclude – Intra-Scope Role-to-Role Traffic",
+                f"All sources are role labels (intra-scope): {'; '.join(remaining)}",
                 [])
 
     # Step 6: Only label groups → Review
@@ -656,6 +669,7 @@ def generate_report(nc, rv, ex, stats, logs, config, out_path):
         ("Step 3", "A-END_USER_COMPUTE_(EUC) present → Requires Review"),
         ("Step 4", "Non-excluded IPL- sources remain → Non-Compliant (finding)"),
         ("Step 5", "All remaining A-*/E-* → Excluded (app-to-app permitted)"),
+        ("Step 5b", "All remaining R-* role labels → Excluded (intra-scope server-to-server)"),
         ("Step 6", "Only label groups remain → Requires Review (edge case)"),
         ("Step 7", "Everything else (R-*, other) → Non-Compliant"),
         ("", ""),
@@ -733,6 +747,207 @@ def export_edr_csv(nc, path):
 
 
 # =============================================================================
+# WORKLOADER VALIDATION (optional backup via brian1917/workloader)
+# =============================================================================
+
+def run_workloader_validation(workloader_path, config, nc_rules, script_dir=None):
+    """
+    Run workloader rule-export as a validation/backup source.
+
+    1. Calls workloader rule-export --policy-version active --expand-svcs
+    2. Parses the CSV output
+    3. Applies the same E-PD + restricted port filters
+    4. Compares against our script's non-compliant results
+    5. Logs discrepancies
+
+    Args:
+        workloader_path: Path to workloader binary
+        config: Full config dict
+        nc_rules: List of non-compliant rule dicts from our script
+        script_dir: Directory to save workloader output (default: cwd)
+    """
+    import subprocess
+
+    if script_dir is None:
+        script_dir = os.path.dirname(os.path.abspath(__file__)) or "."
+
+    comp = config.get("compliance", {})
+    restricted_ports = set(str(p) for p in comp.get("restricted_ports", ["22", "23", "3389", "7389"]))
+
+    # Verify workloader binary exists
+    wl_bin = os.path.abspath(workloader_path)
+    if not os.path.isfile(wl_bin):
+        # Try as command in PATH
+        import shutil
+        wl_bin = shutil.which(workloader_path)
+        if not wl_bin:
+            logging.error(f"Workloader binary not found: {workloader_path}")
+            return None
+
+    logging.info("=" * 72)
+    logging.info("WORKLOADER VALIDATION")
+    logging.info(f"Binary: {wl_bin}")
+    logging.info("=" * 72)
+
+    # Build output filename
+    wl_output = os.path.join(script_dir, f"workloader_rule_export_{time.strftime('%Y%m%d_%H%M%S')}.csv")
+
+    # Build workloader command
+    # Flags from: workloader rule-export --help
+    #   --policy-version active  (export active/provisioned rules)
+    #   --expand-svcs            (show ports/protocols instead of service hrefs)
+    #   --no-href                (clean output, no href column)
+    #   --output-file <path>     (specify output CSV path)
+    #   --out csv                (output format)
+    cmd = [
+        wl_bin, "rule-export",
+        "--policy-version", "active",
+        "--expand-svcs",
+        "--no-href",
+        "--output-file", wl_output,
+        "--out", "csv",
+    ]
+
+    # Add config file if specified in our config (path to pce.yaml)
+    wl_config = config.get("workloader", {}).get("config_file")
+    if wl_config:
+        cmd.extend(["--config-file", wl_config])
+
+    # Add PCE override if multiple PCEs configured in pce.yaml
+    wl_pce = config.get("workloader", {}).get("pce_name")
+    if wl_pce:
+        cmd.extend(["--pce", wl_pce])
+
+    logging.info(f"Running: {' '.join(cmd)}")
+
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=300
+        )
+
+        if result.returncode != 0:
+            logging.error(f"Workloader exited with code {result.returncode}")
+            if result.stderr:
+                logging.error(f"Workloader stderr: {result.stderr[:500]}")
+            if result.stdout:
+                logging.info(f"Workloader stdout: {result.stdout[:500]}")
+            return None
+
+        logging.info(f"Workloader export complete: {wl_output}")
+
+    except FileNotFoundError:
+        logging.error(f"Could not execute workloader: {wl_bin}")
+        return None
+    except subprocess.TimeoutExpired:
+        logging.error("Workloader timed out after 300 seconds")
+        return None
+    except Exception as e:
+        logging.error(f"Workloader error: {e}")
+        return None
+
+    # --- Parse workloader output and apply our filters ---
+    if not os.path.isfile(wl_output):
+        logging.error(f"Workloader output file not found: {wl_output}")
+        return None
+
+    try:
+        wl_rules = []
+        with open(wl_output, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            wl_headers = reader.fieldnames
+            logging.info(f"Workloader CSV columns: {wl_headers}")
+            for row in reader:
+                wl_rules.append(row)
+
+        logging.info(f"Workloader exported {len(wl_rules)} total rules")
+
+        # Apply our filters to workloader output
+        # Workloader column names vary but typically include:
+        #   ruleset_name, ruleset_scope, src_labels, src_iplists,
+        #   dst_labels, dst_iplists, services (or expanded port columns)
+        # With --expand-svcs the services show as ports/protocols
+
+        wl_filtered = []
+        for row in wl_rules:
+            # Get scope — try common column names
+            scopes = (row.get("ruleset_scope", "")
+                      or row.get("Scopes", "")
+                      or row.get("scopes", ""))
+
+            # E-PD filter
+            if "E-PD" not in scopes:
+                continue
+
+            # Get services — try common column names
+            services = (row.get("services", "")
+                        or row.get("Destination Services", "")
+                        or row.get("ingress_services", ""))
+
+            # Check for restricted ports in services
+            has_restricted = False
+            for rp in restricted_ports:
+                if rp in services:
+                    has_restricted = True
+                    break
+
+            if not has_restricted:
+                continue
+
+            # Get sources
+            sources = (row.get("src_labels", "") + ";" +
+                       row.get("src_iplists", "") +
+                       row.get("Sources", ""))
+
+            wl_filtered.append({
+                "ruleset": row.get("ruleset_name", row.get("Ruleset", "")),
+                "scopes": scopes,
+                "sources": sources,
+                "services": services,
+            })
+
+        logging.info(f"Workloader rules after E-PD + restricted port filter: {len(wl_filtered)}")
+
+        # --- Compare against our results ---
+        our_rulesets = set(r["ruleset"] for r in nc_rules)
+        wl_rulesets = set(r["ruleset"] for r in wl_filtered)
+
+        only_in_ours = our_rulesets - wl_rulesets
+        only_in_wl = wl_rulesets - our_rulesets
+        in_both = our_rulesets & wl_rulesets
+
+        logging.info(f"COMPARISON:")
+        logging.info(f"  Our non-compliant rulesets:        {len(our_rulesets)}")
+        logging.info(f"  Workloader filtered rulesets:      {len(wl_rulesets)}")
+        logging.info(f"  In both:                           {len(in_both)}")
+
+        if only_in_ours:
+            logging.warning(f"  In our results but NOT workloader: {len(only_in_ours)}")
+            for rs in sorted(only_in_ours):
+                logging.warning(f"    - {rs}")
+
+        if only_in_wl:
+            logging.warning(f"  In workloader but NOT our results: {len(only_in_wl)}")
+            for rs in sorted(only_in_wl):
+                logging.warning(f"    - {rs}")
+
+        if not only_in_ours and not only_in_wl:
+            logging.info("  VALIDATION PASSED — results match")
+
+        return {
+            "wl_total": len(wl_rules),
+            "wl_filtered": len(wl_filtered),
+            "in_both": len(in_both),
+            "only_ours": sorted(only_in_ours),
+            "only_wl": sorted(only_in_wl),
+            "wl_output_file": wl_output,
+        }
+
+    except Exception as e:
+        logging.error(f"Error parsing workloader output: {e}")
+        return None
+
+
+# =============================================================================
 # MAIN
 # =============================================================================
 
@@ -745,6 +960,9 @@ def main():
     parser.add_argument("--edr-export", default=None, help="EDR CSV path for Splunk")
     parser.add_argument("--target-cis", default=None,
                         help="Comma-separated Target CIs to filter by")
+    parser.add_argument("--workloader", default=None,
+                        help="Path to workloader binary for validation "
+                             "(e.g., ./workloader or C:\\Scripts\\workloader.exe)")
     parser.add_argument("--version", "-v", action="version",
                         version=f"%(prog)s {__version__}")
     args = parser.parse_args()
@@ -805,6 +1023,21 @@ def main():
             export_edr_csv(nc, edr)
         elif edr:
             logging.info("EDR export skipped — no non-compliant rules")
+
+        # Workloader validation (optional)
+        if args.workloader:
+            wl_result = run_workloader_validation(
+                workloader_path=args.workloader,
+                config=config,
+                nc_rules=nc,
+                script_dir=os.path.dirname(os.path.abspath(out)),
+            )
+            if wl_result:
+                logging.info(f"Workloader export saved: {wl_result['wl_output_file']}")
+                if wl_result["only_ours"] or wl_result["only_wl"]:
+                    logging.warning("Workloader validation found discrepancies — review logs")
+                else:
+                    logging.info("Workloader validation PASSED")
 
         logging.info("Script completed successfully.")
         return 1 if nc_ct > 0 else (3 if rv_ct > 0 else 0)
